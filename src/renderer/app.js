@@ -10,9 +10,6 @@ const $ = (sel) => document.querySelector(sel);
 
 const INTERNAL_ROOT = '/storage/emulated/0';
 const DRAG_MIME = 'application/x-macandroid';
-// Phone selections up to this size are copied to a temp folder in the background, so dragging them
-// straight to the Mac starts instantly. Bigger ones still drag within the app (to the other side).
-const PREPARE_LIMIT = 300 * 1024 * 1024;
 
 const S = {
   platform: 'darwin',
@@ -29,7 +26,6 @@ const S = {
   lastDeviceDir: {}, // deviceId -> folder last visited on that phone
   transfers: new Map(),
   thumbCache: new Map(),
-  prepared: new Map(), // selection key -> temp file paths ready for a native drag
   viewer: null,
 };
 
@@ -767,7 +763,6 @@ function updateSelectionUI(p) {
   });
   renderActionbar();
   renderStatus(p);
-  schedulePrepare(p);
 }
 
 function selectIndex(p, i, { toggle = false, range = false } = {}) {
@@ -797,31 +792,6 @@ function focusIndex(p) {
 function scrollIntoView(p, i) {
   const el = p.content.querySelector(`[data-i="${i}"]`);
   if (el) el.scrollIntoView({ block: 'nearest' });
-}
-
-// ---------------------------------------------------------------------------
-// Background preparation for dragging phone files straight to the Mac
-// ---------------------------------------------------------------------------
-
-const selectionKey = (loc, entries) => entries.map((e) => thumbKey(loc, e)).sort().join('\n');
-let prepareTimer = null;
-
-/** Copy the selected phone items to temp files shortly after they are selected. */
-function schedulePrepare(p) {
-  clearTimeout(prepareTimer);
-  if (!isDeviceDir(p.loc)) return;
-  const entries = selectedEntries(p);
-  if (!entries.length) return;
-  const key = selectionKey(p.loc, entries);
-  if (S.prepared.has(key)) return;
-  if (entries.filter((e) => !e.isDir).reduce((a, e) => a + e.size, 0) > PREPARE_LIMIT) return;
-  const loc = fsLoc(p.loc);
-  prepareTimer = setTimeout(async () => {
-    try {
-      const files = await api.prepareDrag(loc, entries, PREPARE_LIMIT);
-      if (files) S.prepared.set(key, files);
-    } catch {}
-  }, 350);
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,9 +1205,7 @@ function dropTargetFor(el) {
 }
 
 let dragSource = null; // { from, paths }
-let nativeDrag = null; // { from, paths, files }: items handed to the OS as a real file drag
 let dropHighlight = null;
-const sameSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
 
 function clearDropHighlight() {
   if (dropHighlight) dropHighlight.classList.remove('drop-target', 'drop-active');
@@ -1245,15 +1213,6 @@ function clearDropHighlight() {
 }
 
 function setupDnD() {
-  document.addEventListener(
-    'mousedown',
-    () => {
-      nativeDrag = null;
-      dragSource = null;
-    },
-    true
-  );
-
   document.addEventListener('dragstart', (ev) => {
     const row = ev.target.closest && ev.target.closest('[data-i]');
     const p = paneOf(ev.target);
@@ -1262,22 +1221,8 @@ function setupDnD() {
     if (!p.selection.has(p.shown[i].path)) selectIndex(p, i);
     const entries = selectedEntries(p);
     dragSource = { from: { kind: p.loc.kind, id: p.loc.id }, paths: entries.map((e) => e.path) };
-    const icon = S.thumbCache.get(thumbKey(p.loc, entries[0])) || null;
-
-    // A real OS file drag works everywhere: Finder, the desktop, other apps, and the other pane.
-    const files = p.loc.kind === 'local' ? dragSource.paths : S.prepared.get(selectionKey(p.loc, entries)) || null;
-    if (files) {
-      ev.preventDefault();
-      nativeDrag = { ...dragSource, files };
-      api.startDrag(files, icon);
-      return;
-    }
-    // Phone files not ready yet (or very large): drag inside the app, e.g. to the other pane.
     ev.dataTransfer.setData(DRAG_MIME, JSON.stringify(dragSource));
     ev.dataTransfer.effectAllowed = 'copy';
-    const big = entries.filter((e) => !e.isDir).reduce((a, e) => a + e.size, 0) > PREPARE_LIMIT;
-    toast(big ? 'קבצים גדולים: גרור לצד השני או לתיקייה בסרגל, או לחץ "העתק למחשב"' : 'מכין את הקבצים… לגרירה ישירה ל-Finder נסה שוב בעוד רגע');
-    schedulePrepare(p);
   });
   document.addEventListener('dragend', () => {
     dragSource = null;
@@ -1328,15 +1273,7 @@ function setupDnD() {
       return startTransfer(src.from, src.paths, target.loc);
     }
     const files = [...ev.dataTransfer.files].map((f) => api.pathForFile(f)).filter(Boolean);
-    if (!files.length) return;
-    if (nativeDrag && sameSet(files, nativeDrag.files)) {
-      // Our own drag landed back in the window: copy from the original place, not the temp copies.
-      const src = nativeDrag;
-      nativeDrag = null;
-      dragSource = null;
-      return startTransfer(src.from, src.paths, target.loc);
-    }
-    startTransfer({ kind: 'local' }, files, target.loc);
+    if (files.length) startTransfer({ kind: 'local' }, files, target.loc);
   });
 }
 

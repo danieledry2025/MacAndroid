@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { pipeline } = require('stream/promises');
-const { app, BrowserWindow, ipcMain, shell, dialog, Menu, clipboard, nativeTheme, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, Menu, clipboard, nativeTheme, } = require('electron');
 const { AdbManager } = require('./adb');
 const { MockManager } = require('./mock');
 const { LocalFs } = require('./local');
@@ -23,7 +23,6 @@ let win = null;
 let thumbs = null;
 let lastAdbError = null;
 let lastMacFolder = null;
-const preparedDirs = new Map();
 const conflictWaiters = new Map();
 let conflictSeq = 0;
 
@@ -81,29 +80,6 @@ async function materialize(loc, entry) {
   return out;
 }
 
-/** Copy a phone folder into a fresh temp folder (for dragging it out to the Mac). */
-async function materializeDir(loc, entry) {
-  const fsys = fsFor(loc);
-  const root = path.join(app.getPath('temp'), 'MacAndroid', 'drag', crypto.randomBytes(6).toString('hex'), entry.name);
-  const walk = async (remote, local) => {
-    fs.mkdirSync(local, { recursive: true });
-    for (const e of await fsys.readdir(remote)) {
-      if (e.isDir) await walk(e.path, path.join(local, e.name));
-      else {
-        await pipeline(await fsys.openRead(e.path), fs.createWriteStream(path.join(local, e.name)));
-      }
-    }
-  };
-  await walk(entry.path, root);
-  return root;
-}
-
-async function treeSize(fsys, p) {
-  let total = 0;
-  for (const e of await fsys.readdir(p)) total += e.isDir ? await treeSize(fsys, e.path) : e.size;
-  return total;
-}
-
 
 function registerIpc() {
   ipcMain.handle('app:init', () => ({
@@ -154,42 +130,6 @@ function registerIpc() {
 
 
   /** Copy phone items to temp files so they can be dragged out to Finder. */
-  /**
-   * Copy phone items to temp files in the background, so they can be dragged straight to the Mac the
-   * moment the user starts dragging. Returns null when the items are too big to prepare.
-   */
-  ipcMain.handle('drag:prepare', async (_e, loc, entries, limit) => {
-    const fsys = fsFor(loc);
-    let total = 0;
-    for (const en of entries) {
-      total += en.isDir ? await treeSize(fsys, en.path) : en.size;
-      if (total > limit) return null;
-    }
-    const files = [];
-    for (const en of entries) {
-      if (!en.isDir) files.push(await materialize(loc, en));
-      else {
-        const key = `${loc.id}|${en.path}|${en.mtime}`;
-        const hit = preparedDirs.get(key);
-        if (hit && fs.existsSync(hit.path) && Date.now() - hit.at < 120000) files.push(hit.path);
-        else {
-          const dir = await materializeDir(loc, en);
-          preparedDirs.set(key, { path: dir, at: Date.now() });
-          files.push(dir);
-        }
-      }
-    }
-    return files;
-  });
-
-  ipcMain.on('drag:start', (e, files, iconPath) => {
-    let icon = iconPath ? nativeImage.createFromPath(iconPath) : null;
-    if (!icon || icon.isEmpty()) icon = nativeImage.createFromPath(path.join(__dirname, '..', 'assets', 'icon.png'));
-    icon = icon.resize({ width: 64 });
-    try {
-      e.sender.startDrag(files.length === 1 ? { file: files[0], icon } : { file: files[0], files, icon });
-    } catch {}
-  });
   ipcMain.handle('fs:reveal', (_e, p) => shell.showItemInFolder(p));
 
   ipcMain.handle('thumb:get', async (_e, loc, entry, gen) => {

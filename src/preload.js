@@ -29,8 +29,6 @@ contextBridge.exposeInMainWorld('api', {
   chooseFiles: (title) => invoke('dialog:choose-files', title),
   confirm: (opts) => invoke('dialog:confirm', opts),
   popupMenu: (template) => invoke('menu:popup', template),
-  prepareDrag: (loc, entries, limit) => invoke('drag:prepare', loc, entries, limit),
-  startDrag: (files, icon) => ipcRenderer.send('drag:start', files, icon),
   /** Real path of a file dropped from Finder. */
   pathForFile: (file) => webUtils.getPathForFile(file),
   onDevices: (cb) => on('devices', cb),

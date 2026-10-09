@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' file: data:; media-src 'self' file:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+    <title>MacAndroid</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside class="sidebar">
+        <div class="sidebar-top drag"></div>
+        <nav>
+          <h4>מכשירים</h4>
+          <ul id="device-list" class="nav-list"></ul>
+          <h4>המחשב הזה</h4>
+          <ul id="places" class="nav-list"></ul>
+        </nav>
+      </aside>
+
+      <main>
+        <header class="toolbar drag">
+          <div class="nav-buttons no-drag">
+            <button id="btn-back" class="icon-btn" title="אחורה (⌘[)"></button>
+            <button id="btn-forward" class="icon-btn" title="קדימה (⌘])"></button>
+            <button id="btn-up" class="icon-btn" title="תיקייה למעלה (⌘↑)"></button>
+          </div>
+          <div id="breadcrumbs" class="breadcrumbs no-drag"></div>
+          <div class="toolbar-end no-drag">
+            <div class="search">
+              <input id="search" type="search" placeholder="חיפוש בתיקייה" />
+            </div>
+            <div class="segmented" role="group" aria-label="תצוגה">
+              <button id="view-grid" class="icon-btn" title="סמלים גדולים"></button>
+              <button id="view-list" class="icon-btn" title="פרטים"></button>
+            </div>
+          </div>
+        </header>
+
+        <div id="actionbar" class="actionbar"></div>
+
+        <section id="content" class="content" tabindex="0"></section>
+
+        <footer class="statusbar">
+          <span id="status-left"></span>
+          <span id="status-right"></span>
+        </footer>
+      </main>
+    </div>
+
+    <div id="transfers" class="transfers hidden">
+      <div class="transfers-head">
+        <strong>העברות</strong>
+        <div>
+          <button id="transfers-clear" class="link-btn">נקה</button>
+          <button id="transfers-close" class="icon-btn small" title="הסתר"></button>
+        </div>
+      </div>
+      <div id="transfer-list"></div>
+    </div>
+
+    <div id="viewer" class="viewer hidden">
+      <div class="viewer-top">
+        <span id="viewer-title"></span>
+        <div class="viewer-actions">
+          <button id="viewer-copy" class="btn">העתק למחשב</button>
+          <button id="viewer-open" class="btn">פתח באפליקציה</button>
+          <button id="viewer-close" class="icon-btn" title="סגור (Esc)"></button>
+        </div>
+      </div>
+      <button id="viewer-prev" class="viewer-nav prev" title="הקודם"></button>
+      <div id="viewer-stage" class="viewer-stage"></div>
+      <button id="viewer-next" class="viewer-nav next" title="הבא"></button>
+    </div>
+
+    <div id="modal" class="modal hidden">
+      <div class="modal-card" role="dialog" aria-modal="true">
+        <div id="modal-body"></div>
+        <div id="modal-buttons" class="modal-buttons"></div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="icons.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

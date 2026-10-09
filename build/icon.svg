@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a8dff"/>
+      <stop offset="1" stop-color="#0a56c2"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a7f3c4"/>
+      <stop offset="1" stop-color="#3ddc84"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <!-- folder -->
+  <path d="M190 360a40 40 0 0140-40h170l55 55h300a40 40 0 0140 40v40H190z" fill="#e8a91b"/>
+  <rect x="190" y="410" width="605" height="360" rx="40" fill="#ffc83d"/>
+  <!-- phone -->
+  <rect x="560" y="250" width="260" height="480" rx="44" fill="#1f2937"/>
+  <rect x="584" y="296" width="212" height="380" rx="14" fill="url(#screen)"/>
+  <rect x="660" y="700" width="60" height="10" rx="5" fill="#9ca3af"/>
+  <!-- arrow -->
+  <path d="M300 590h170" stroke="#fff" stroke-width="44" stroke-linecap="round"/>
+  <path d="M420 530l70 60-70 60" fill="none" stroke="#fff" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

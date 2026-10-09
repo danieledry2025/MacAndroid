@@ -1,0 +1,70 @@
+{
+  "name": "macandroid",
+  "productName": "MacAndroid",
+  "version": "0.1.0",
+  "description": "העברת קבצים בין אנדרואיד ל-Mac בכבל USB, עם ממשק בסגנון סייר הקבצים",
+  "license": "MIT",
+  "private": true,
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "demo": "electron . --mock",
+    "test": "node --test test/*.test.js",
+    "fetch-adb": "node scripts/fetch-adb.js",
+    "dist": "node scripts/fetch-adb.js && electron-builder --mac",
+    "dist:arm64": "node scripts/fetch-adb.js && electron-builder --mac --arm64",
+    "dist:x64": "node scripts/fetch-adb.js && electron-builder --mac --x64"
+  },
+  "dependencies": {
+    "@devicefarmer/adbkit": "^3.3.9"
+  },
+  "devDependencies": {
+    "electron": "^38.8.6",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.danieledry.macandroid",
+    "productName": "MacAndroid",
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/platform-tools",
+        "to": "platform-tools",
+        "filter": [
+          "adb",
+          "adb.exe",
+          "*.dll",
+          "NOTICE.txt"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "identity": "-",
+      "hardenedRuntime": false
+    },
+    "dmg": {
+      "title": "MacAndroid"
+    }
+  }
+}

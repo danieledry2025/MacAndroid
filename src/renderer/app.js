@@ -1,10 +1,8 @@
 'use strict';
 
-/* global ICONS, FOLDER_SVG, fileSvg, DRIVE_SVG */
+/* global api, ICONS, FOLDER_SVG, fileSvg, DRIVE_SVG */
 
-/* global api */
 const $ = (sel) => document.querySelector(sel);
-const contentEl = $('#content');
 
 // ---------------------------------------------------------------------------
 // State
@@ -12,6 +10,9 @@ const contentEl = $('#content');
 
 const INTERNAL_ROOT = '/storage/emulated/0';
 const DRAG_MIME = 'application/x-macandroid';
+// Phone selections up to this size are copied to a temp folder in the background, so dragging them
+// straight to the Mac starts instantly. Bigger ones still drag within the app (to the other side).
+const PREPARE_LIMIT = 300 * 1024 * 1024;
 
 const S = {
   platform: 'darwin',
@@ -19,29 +20,17 @@ const S = {
   places: [],
   adbError: null,
   mock: false,
-  loc: { type: 'welcome' },
-  history: [],
-  hIndex: -1,
-  entries: [],
-  shown: [],
-  loading: false,
-  loadError: null,
-  selection: new Set(),
-  anchor: null,
   view: store('view') || 'grid',
-  sort: { key: 'name', dir: 1 },
-  search: '',
-  gen: 0,
-  clipboard: null, // { from: {kind,id}, paths, label }
+  sort: loadSort(),
+  split: store('split') !== '0',
+  activeIdx: 0,
+  clipboard: null, // { from: {kind,id}, paths }
   storages: {}, // deviceId -> [{label, path, total, free}]
   lastDeviceDir: {}, // deviceId -> folder last visited on that phone
   transfers: new Map(),
   thumbCache: new Map(),
-  renaming: null,
-  finder: { supported: false, mounts: {}, settings: {} },
-  preparedDrag: new Set(), // phone files already copied to temp, so dragging them out is instant
+  prepared: new Map(), // selection key -> temp file paths ready for a native drag
   viewer: null,
-  autoOpened: new Set(),
 };
 
 function store(key, value) {
@@ -52,6 +41,59 @@ function store(key, value) {
   return null;
 }
 
+function loadSort() {
+  try {
+    const s = JSON.parse(store('sort'));
+    if (s && s.key && (s.dir === 1 || s.dir === -1)) return s;
+  } catch {}
+  // Newest first by default.
+  return { key: 'mtime', dir: -1 };
+}
+
+/** One file browser. Two of them side by side make the split view. */
+function makePane(idx) {
+  const el = document.querySelector(`.pane[data-pane="${idx}"]`);
+  const pane = {
+    idx,
+    el,
+    content: el.querySelector('.content'),
+    crumbs: el.querySelector('.breadcrumbs'),
+    statusLeft: el.querySelector('.status-left'),
+    statusRight: el.querySelector('.status-right'),
+    loc: { type: 'welcome' },
+    history: [],
+    hIndex: -1,
+    entries: [],
+    shown: [],
+    loading: false,
+    loadError: null,
+    selection: new Set(),
+    anchor: null,
+    search: '',
+    gen: 0,
+  };
+  pane.observer = new IntersectionObserver(
+    (items) => {
+      for (const it of items) {
+        if (!it.isIntersecting) continue;
+        pane.observer.unobserve(it.target);
+        requestThumb(pane, it.target);
+      }
+    },
+    { root: pane.content, rootMargin: '300px' }
+  );
+  return pane;
+}
+
+const panes = [makePane(0), makePane(1)];
+const active = () => panes[S.split ? S.activeIdx : 0];
+const visiblePanes = () => (S.split ? panes : [panes[0]]);
+const otherPane = (p) => (S.split ? panes[1 - p.idx] : null);
+const paneOf = (el) => {
+  const node = el && el.closest && el.closest('.pane');
+  return node ? panes[Number(node.dataset.pane)] : null;
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -60,7 +102,7 @@ const esc = (s) =>
   String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 // Sizes are wrapped in Unicode isolates so "29 GB" keeps its order inside Hebrew text.
-const ltr = (s) => `\u2066${s}\u2069`;
+const ltr = (s) => `⁦${s}⁩`;
 
 function fmtSize(n) {
   if (n == null || isNaN(n)) return '';
@@ -148,58 +190,69 @@ function errMsg(err) {
 
 const device = (id) => S.devices.find((d) => d.id === id);
 const readyDevices = () => S.devices.filter((d) => d.state === 'device');
-const isDir = (loc = S.loc) => loc.type === 'dir';
-const isDeviceDir = (loc = S.loc) => loc.type === 'dir' && loc.kind === 'device';
-const isLocalDir = (loc = S.loc) => loc.type === 'dir' && loc.kind === 'local';
-const fsLoc = (loc = S.loc) => ({ kind: loc.kind, id: loc.id, path: loc.path });
+const isDir = (loc) => loc.type === 'dir';
+const isDeviceDir = (loc) => loc.type === 'dir' && loc.kind === 'device';
+const isLocalDir = (loc) => loc.type === 'dir' && loc.kind === 'local';
+const isDeviceLoc = (loc) => loc.kind === 'device' || loc.type === 'device-root';
+const fsLoc = (loc) => ({ kind: loc.kind, id: loc.id, path: loc.path });
 const sameLoc = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const sameDir = (a, b) => isDir(a) && isDir(b) && a.kind === b.kind && (a.id || null) === (b.id || null) && a.path === b.path;
 
 function storageFor(id, p) {
   const list = S.storages[id] || [];
   return list.filter((s) => p === s.path || p.startsWith(s.path + '/')).sort((a, b) => b.path.length - a.path.length)[0];
 }
 
-/** Human title for a location (used in transfer titles and tooltips). */
+/** Human title for a folder (used in buttons and transfer titles). */
 function locTitle(loc) {
   if (loc.kind === 'device') {
     const st = storageFor(loc.id, loc.path);
     if (st && loc.path === st.path) return st.label;
+    if (loc.path === INTERNAL_ROOT) return 'אחסון פנימי';
     return basename(loc.path);
   }
   const place = S.places.find((p) => p.path === loc.path);
   return place ? place.label : basename(loc.path);
 }
 
-function navigate(loc, { push = true } = {}) {
-  if (push) {
-    S.history = S.history.slice(0, S.hIndex + 1);
-    S.history.push(loc);
-    S.hIndex = S.history.length - 1;
-  }
-  S.loc = loc;
-  S.selection.clear();
-  S.anchor = null;
-  S.search = '';
-  $('#search').value = '';
-  S.entries = [];
-  S.shown = [];
-  S.loadError = null;
-  S.gen++;
-  if (isDeviceDir(loc)) S.lastDeviceDir[loc.id] = loc.path;
-  renderAll();
-  load();
+function defaultMacLoc() {
+  const place = S.places.find((p) => p.id === 'downloads') || S.places.find((p) => p.id === 'home') || S.places[0];
+  return place ? { type: 'dir', kind: 'local', path: place.path } : { type: 'welcome' };
 }
 
-function goBack() {
-  if (S.hIndex > 0) {
-    S.hIndex--;
-    navigate(S.history[S.hIndex], { push: false });
+function navigate(p, loc, { push = true } = {}) {
+  if (push) {
+    p.history = p.history.slice(0, p.hIndex + 1);
+    p.history.push(loc);
+    p.hIndex = p.history.length - 1;
+  }
+  p.loc = loc;
+  p.selection.clear();
+  p.anchor = null;
+  p.search = '';
+  if (p === active()) $('#search').value = '';
+  p.entries = [];
+  p.shown = [];
+  p.loadError = null;
+  p.gen++;
+  if (isDeviceDir(loc)) S.lastDeviceDir[loc.id] = loc.path;
+  renderSidebar();
+  renderToolbar();
+  renderActionbar();
+  renderPane(p);
+  load(p);
+}
+
+function goBack(p) {
+  if (p.hIndex > 0) {
+    p.hIndex--;
+    navigate(p, p.history[p.hIndex], { push: false });
   }
 }
-function goForward() {
-  if (S.hIndex < S.history.length - 1) {
-    S.hIndex++;
-    navigate(S.history[S.hIndex], { push: false });
+function goForward(p) {
+  if (p.hIndex < p.history.length - 1) {
+    p.hIndex++;
+    navigate(p, p.history[p.hIndex], { push: false });
   }
 }
 function parentOf(loc) {
@@ -212,64 +265,69 @@ function parentOf(loc) {
   if (loc.path === '/') return null;
   return { ...loc, path: dirname(loc.path) };
 }
-function goUp() {
-  const p = parentOf(S.loc);
-  if (p) navigate(p);
+function goUp(p) {
+  const parent = parentOf(p.loc);
+  if (parent) navigate(p, parent);
 }
 
-async function load() {
-  const loc = S.loc;
-  const gen = S.gen;
+async function load(p) {
+  const loc = p.loc;
+  const gen = p.gen;
   if (loc.type === 'device-root') {
     if (device(loc.id)?.state === 'device') await refreshStorages(loc.id);
-    if (gen === S.gen) renderContent();
+    if (gen === p.gen) renderContent(p);
     return;
   }
   if (!isDir(loc)) return;
-  if (isDeviceDir(loc) && device(loc.id)?.state !== 'device') return renderAll();
-  S.loading = true;
+  if (isDeviceDir(loc) && device(loc.id)?.state !== 'device') return renderPane(p);
+  p.loading = true;
   // Only show the spinner if loading is actually slow.
-  const spinTimer = setTimeout(() => gen === S.gen && S.loading && renderContent(), 150);
+  const spinTimer = setTimeout(() => gen === p.gen && p.loading && renderContent(p), 150);
   try {
-    if (isDeviceDir(loc) && !S.storages[loc.id]) refreshStorages(loc.id).then(renderStatus);
+    if (isDeviceDir(loc) && !S.storages[loc.id]) refreshStorages(loc.id).then(() => renderStatus(p));
     const entries = await api.readdir(fsLoc(loc));
-    if (gen !== S.gen) return;
-    S.entries = entries;
-    S.loadError = null;
+    if (gen !== p.gen) return;
+    p.entries = entries;
+    p.loadError = null;
   } catch (err) {
-    if (gen !== S.gen) return;
-    S.entries = [];
-    S.loadError = errMsg(err);
+    if (gen !== p.gen) return;
+    p.entries = [];
+    p.loadError = errMsg(err);
   } finally {
     clearTimeout(spinTimer);
-    if (gen === S.gen) S.loading = false;
+    if (gen === p.gen) p.loading = false;
   }
-  applyView();
-  renderContent();
-  renderStatus();
+  applyView(p);
+  renderContent(p);
+  renderStatus(p);
   renderActionbar();
 }
 
-/** Re-read the current folder, keeping the selection where possible. */
-async function reload() {
-  if (!isDir()) return load();
-  const keep = new Set(S.selection);
-  const gen = S.gen;
+/** Re-read a pane's folder, keeping the selection where possible. */
+async function reload(p) {
+  if (!isDir(p.loc)) return load(p);
+  const keep = new Set(p.selection);
+  const gen = p.gen;
   try {
-    const entries = await api.readdir(fsLoc());
-    if (gen !== S.gen) return;
-    S.entries = entries;
-    S.loadError = null;
+    const entries = await api.readdir(fsLoc(p.loc));
+    if (gen !== p.gen) return;
+    p.entries = entries;
+    p.loadError = null;
   } catch (err) {
-    S.loadError = errMsg(err);
+    p.loadError = errMsg(err);
   }
-  const paths = new Set(S.entries.map((e) => e.path));
-  S.selection = new Set([...keep].filter((p) => paths.has(p)));
-  applyView();
-  renderContent();
-  renderStatus();
+  const paths = new Set(p.entries.map((e) => e.path));
+  p.selection = new Set([...keep].filter((x) => paths.has(x)));
+  applyView(p);
+  renderContent(p);
+  renderStatus(p);
   renderActionbar();
-  if (isDeviceDir()) refreshStorages(S.loc.id).then(renderStatus);
+  if (isDeviceDir(p.loc)) refreshStorages(p.loc.id).then(() => renderStatus(p));
+}
+
+/** Reload every visible pane that shows this folder. */
+function reloadWhere(loc) {
+  for (const p of visiblePanes()) if (sameDir(p.loc, loc)) reload(p);
 }
 
 async function refreshStorages(id) {
@@ -281,13 +339,11 @@ async function refreshStorages(id) {
   renderSidebar();
 }
 
-function showHidden() {
-  return store('hidden') === '1';
-}
+const showHidden = () => store('hidden') === '1';
 
-function applyView() {
-  const q = S.search.trim().toLowerCase();
-  let list = S.entries.filter((e) => showHidden() || !e.name.startsWith('.'));
+function applyView(p) {
+  const q = p.search.trim().toLowerCase();
+  let list = p.entries.filter((e) => showHidden() || !e.name.startsWith('.'));
   if (q) list = list.filter((e) => e.name.toLowerCase().includes(q));
   const { key, dir } = S.sort;
   const collator = new Intl.Collator('he', { numeric: true, sensitivity: 'base' });
@@ -297,10 +353,21 @@ function applyView() {
     if (key === 'size') r = (a.size || 0) - (b.size || 0);
     else if (key === 'mtime') r = (a.mtime || 0) - (b.mtime || 0);
     else if (key === 'kind') r = collator.compare(a.isDir ? '' : KIND_LABEL[kindOf(a.name)], b.isDir ? '' : KIND_LABEL[kindOf(b.name)]);
-    if (r === 0) r = collator.compare(a.name, b.name);
+    if (r === 0) return collator.compare(a.name, b.name);
     return r * dir;
   });
-  S.shown = list;
+  if (key === 'name' && dir === -1) list = [...list.filter((e) => e.isDir).reverse(), ...list.filter((e) => !e.isDir).reverse()];
+  p.shown = list;
+}
+
+function setSort(sort) {
+  S.sort = sort;
+  store('sort', JSON.stringify(sort));
+  renderToolbar();
+  for (const p of visiblePanes()) {
+    applyView(p);
+    renderContent(p);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,27 +378,33 @@ function renderAll() {
   renderSidebar();
   renderToolbar();
   renderActionbar();
-  renderContent();
-  renderStatus();
+  for (const p of visiblePanes()) renderPane(p);
+}
+
+function renderPane(p) {
+  renderPaneHead(p);
+  renderContent(p);
+  renderStatus(p);
 }
 
 function renderSidebar() {
+  const loc = active().loc;
   const devList = $('#device-list');
   if (!S.devices.length) {
     devList.innerHTML = `<li class="nav-empty">${S.adbError ? 'ADB לא זמין' : 'אין מכשיר מחובר'}</li>`;
   } else {
     devList.innerHTML = S.devices
       .map((d) => {
-        const active = S.loc.id === d.id && (S.loc.type === 'device-root');
-        let html = `<li class="nav-item ${active ? 'active' : ''} ${d.state !== 'device' ? 'pending' : ''}" data-nav="device-root" data-id="${esc(d.id)}">
+        const on = loc.id === d.id && loc.type === 'device-root';
+        let html = `<li class="nav-item ${on ? 'active' : ''} ${d.state !== 'device' ? 'pending' : ''}" data-nav="device-root" data-id="${esc(d.id)}">
           ${ICONS.phone}<span class="label">${esc(d.name)}</span>
           ${d.state === 'device' ? '<span class="dot"></span>' : '<span class="dot warn"></span>'}
         </li>`;
         if (d.state === 'device') {
           const sts = S.storages[d.id] || [{ id: 'internal', label: 'אחסון פנימי', path: INTERNAL_ROOT, type: 'internal' }];
           for (const st of sts) {
-            const on = isDeviceDir() && S.loc.id === d.id && storageFor(d.id, S.loc.path)?.path === st.path;
-            html += `<li class="nav-item sub ${on ? 'active' : ''}" data-nav="device-dir" data-id="${esc(d.id)}" data-path="${esc(st.path)}" data-drop="device">
+            const sel = isDeviceDir(loc) && loc.id === d.id && storageFor(d.id, loc.path)?.path === st.path;
+            html += `<li class="nav-item sub ${sel ? 'active' : ''}" data-nav="device-dir" data-id="${esc(d.id)}" data-path="${esc(st.path)}" data-drop="device">
               ${st.type === 'sd' ? ICONS.sd : ICONS.folderSmall}<span class="label">${esc(st.label)}</span>
             </li>`;
           }
@@ -340,12 +413,11 @@ function renderSidebar() {
       })
       .join('');
   }
-
   $('#places').innerHTML = S.places
-    .map((p) => {
-      const on = isLocalDir() && S.loc.path === p.path;
-      return `<li class="nav-item ${on ? 'active' : ''}" data-nav="local-dir" data-path="${esc(p.path)}" data-drop="local">
-        ${ICONS[p.icon] || ICONS.folderSmall}<span class="label">${esc(p.label)}</span>
+    .map((pl) => {
+      const on = isLocalDir(loc) && loc.path === pl.path;
+      return `<li class="nav-item ${on ? 'active' : ''}" data-nav="local-dir" data-path="${esc(pl.path)}" data-drop="local">
+        ${ICONS[pl.icon] || ICONS.folderSmall}<span class="label">${esc(pl.label)}</span>
       </li>`;
     })
     .join('');
@@ -354,15 +426,14 @@ function renderSidebar() {
 function crumbsFor(loc) {
   const out = [];
   if (loc.type === 'welcome') return [{ label: 'MacAndroid' }];
-  if (loc.kind === 'device' || loc.type === 'device-root') {
+  if (isDeviceLoc(loc)) {
     const d = device(loc.id);
     out.push({ label: d ? d.name : loc.id, loc: { type: 'device-root', id: loc.id } });
     if (loc.type === 'dir') {
-      const st = storageFor(loc.id, loc.path) || { path: '/', label: '/' };
+      const st = storageFor(loc.id, loc.path) || { path: INTERNAL_ROOT, label: 'אחסון פנימי' };
       out.push({ label: st.label, loc: { type: 'dir', kind: 'device', id: loc.id, path: st.path } });
-      const rest = loc.path.slice(st.path.length).split('/').filter(Boolean);
       let acc = st.path;
-      for (const part of rest) {
+      for (const part of loc.path.slice(st.path.length).split('/').filter(Boolean)) {
         acc = joinPath(acc, part);
         out.push({ label: part, loc: { type: 'dir', kind: 'device', id: loc.id, path: acc } });
       }
@@ -370,7 +441,7 @@ function crumbsFor(loc) {
     return out;
   }
   // Mac path: start from the home folder when inside it.
-  const home = S.places.find((p) => p.id === 'home');
+  const home = S.places.find((x) => x.id === 'home');
   let base = '/';
   if (home && (loc.path === home.path || loc.path.startsWith(home.path + '/'))) {
     base = home.path;
@@ -386,15 +457,12 @@ function crumbsFor(loc) {
   return out;
 }
 
-function renderToolbar() {
-  $('#btn-back').disabled = S.hIndex <= 0;
-  $('#btn-forward').disabled = S.hIndex >= S.history.length - 1;
-  $('#btn-up').disabled = !parentOf(S.loc);
-  $('#view-grid').classList.toggle('on', S.view === 'grid');
-  $('#view-list').classList.toggle('on', S.view === 'list');
-  $('#search').disabled = !isDir();
-  const crumbs = crumbsFor(S.loc);
-  $('#breadcrumbs').innerHTML = crumbs
+function renderPaneHead(p) {
+  p.el.querySelector('[data-pnav="back"]').disabled = p.hIndex <= 0;
+  p.el.querySelector('[data-pnav="forward"]').disabled = p.hIndex >= p.history.length - 1;
+  p.el.querySelector('[data-pnav="up"]').disabled = !parentOf(p.loc);
+  const crumbs = crumbsFor(p.loc);
+  p.crumbs.innerHTML = crumbs
     .map(
       (c, i) =>
         `${i ? '<span class="crumb-sep">›</span>' : ''}<span class="crumb" data-crumb="${i}" ${
@@ -402,158 +470,169 @@ function renderToolbar() {
         } title="${esc(c.label)}">${esc(c.label)}</span>`
     )
     .join('');
-  $('#breadcrumbs').querySelectorAll('.crumb').forEach((el) => {
+  p.crumbs.querySelectorAll('.crumb').forEach((el) => {
     el._loc = crumbs[Number(el.dataset.crumb)].loc;
   });
   // Keep the deepest folder visible when the path is long (RTL: scroll to the left end).
-  $('#breadcrumbs').scrollLeft = -$('#breadcrumbs').scrollWidth;
+  p.crumbs.scrollLeft = -p.crumbs.scrollWidth;
 }
 
-function selectedEntries() {
-  return S.shown.filter((e) => S.selection.has(e.path));
+function renderToolbar() {
+  const p = active();
+  $('#btn-split').innerHTML = `${ICONS.split}${S.split ? 'מסך מפוצל' : 'פיצול מסך'}`;
+  $('#btn-split').classList.toggle('on', S.split);
+  $('#view-grid').classList.toggle('on', S.view === 'grid');
+  $('#view-list').classList.toggle('on', S.view === 'list');
+  $('#sort-key').value = S.sort.key;
+  $('#sort-dir').innerHTML = S.sort.dir === -1 ? ICONS.sortDown : ICONS.sortUp;
+  $('#sort-dir').title = S.sort.dir === -1 ? 'סדר יורד (החדש או הגדול ראשון)' : 'סדר עולה';
+  $('#search').disabled = !isDir(p.loc);
+  document.body.classList.toggle('split', S.split);
+  panes[1].el.classList.toggle('hidden', !S.split);
+  panes.forEach((x) => x.el.classList.toggle('active', S.split && x === p));
 }
+
+const selectedEntries = (p) => p.shown.filter((e) => p.selection.has(e.path));
 
 function renderActionbar() {
+  const p = active();
   const bar = $('#actionbar');
-  const sel = selectedEntries();
-  const n = sel.length;
-  const canPaste = Boolean(S.clipboard);
-  if (isDeviceDir()) {
-    bar.innerHTML = `
-      <button class="btn primary" data-act="copy-to-mac" ${n ? '' : 'disabled'}>${ICONS.download}העתק למחשב${n ? ` <span class="sub">(${n})</span>` : ''}</button>
-      <button class="btn" data-act="add-from-mac">${ICONS.upload}הוסף קבצים מהמחשב</button>
-      <button class="btn" data-act="new-folder">${ICONS.folderPlus}תיקייה חדשה</button>
-      <button class="btn" data-act="copy" ${n ? '' : 'disabled'} title="⌘C">${ICONS.copy}העתק</button>
-      <button class="btn" data-act="paste" ${canPaste ? '' : 'disabled'} title="⌘V">${ICONS.paste}הדבק</button>
-      <button class="btn danger" data-act="delete" ${n ? '' : 'disabled'}>${ICONS.trash}מחק</button>
-      <span class="spacer"></span>
-      ${S.finder.supported ? `<button class="btn" data-act="finder-open" title="פתח את התיקייה הזו ב-Finder">${ICONS.finder}פתח ב-Finder</button>` : ''}
-      <button class="icon-btn" data-act="refresh" title="רענן (⌘R)">${ICONS.refresh}</button>`;
-  } else if (isLocalDir()) {
-    const d = readyDevices()[0];
-    const target = d ? S.lastDeviceDir[d.id] || joinPath(INTERNAL_ROOT, 'Download') : null;
-    const targetLabel = d ? (storageFor(d.id, target)?.path === target ? 'אחסון פנימי' : basename(target)) : '';
-    bar.innerHTML = `
-      <button class="btn primary" data-act="copy-to-phone" ${n && d ? '' : 'disabled'} title="${d ? esc('יעד: ' + target) : 'חבר טלפון'}">${ICONS.upload}העתק לטלפון${
-        d ? ` <span class="sub">← ${esc(targetLabel)}</span>` : ''
-      }</button>
-      <button class="btn" data-act="new-folder">${ICONS.folderPlus}תיקייה חדשה</button>
-      <button class="btn" data-act="copy" ${n ? '' : 'disabled'} title="⌘C">${ICONS.copy}העתק</button>
-      <button class="btn" data-act="paste" ${canPaste ? '' : 'disabled'} title="⌘V">${ICONS.paste}הדבק</button>
-      <button class="btn danger" data-act="delete" ${n ? '' : 'disabled'}>${ICONS.trash}העבר לפח</button>
-      <span class="spacer"></span>
-      <button class="icon-btn" data-act="refresh" title="רענן (⌘R)">${ICONS.refresh}</button>`;
-  } else {
+  if (!isDir(p.loc)) {
     bar.innerHTML = '';
+    return;
   }
+  const n = selectedEntries(p).length;
+  const o = otherPane(p);
+  const toOther = o && isDir(o.loc) && !sameDir(o.loc, p.loc);
+  const count = n ? ` <span class="sub">(${n})</span>` : '';
+  const onPhone = isDeviceDir(p.loc);
+  let primary;
+  if (toOther) {
+    const where = o.loc.kind === 'local' ? 'מחשב' : o.loc.kind === 'device' && !onPhone ? 'טלפון' : 'צד השני';
+    primary = `<button class="btn primary" data-act="copy-to-other" ${n ? '' : 'disabled'} title="F5">${onPhone ? ICONS.download : ICONS.upload}העתק ל${where} ← ${esc(
+      locTitle(o.loc)
+    )}${count}</button>`;
+  } else if (onPhone) {
+    primary = `<button class="btn primary" data-act="copy-to-mac" ${n ? '' : 'disabled'}>${ICONS.download}העתק למחשב…${count}</button>`;
+  } else {
+    const t = phoneTarget();
+    primary = `<button class="btn primary" data-act="copy-to-phone" ${n && t ? '' : 'disabled'} title="${t ? esc('יעד: ' + t.path) : 'חבר טלפון'}">${ICONS.upload}העתק לטלפון${
+      t ? ` <span class="sub">← ${esc(locTitle(t))}</span>` : ''
+    }${count}</button>`;
+  }
+  bar.innerHTML = `
+    ${primary}
+    ${onPhone ? `<button class="btn" data-act="add-from-mac">${ICONS.upload}הוסף מהמחשב…</button>` : ''}
+    <button class="btn" data-act="new-folder">${ICONS.folderPlus}תיקייה חדשה</button>
+    <button class="btn" data-act="copy" ${n ? '' : 'disabled'} title="⌘C">${ICONS.copy}העתק</button>
+    <button class="btn" data-act="paste" ${S.clipboard ? '' : 'disabled'} title="⌘V">${ICONS.paste}הדבק</button>
+    <button class="btn danger" data-act="delete" ${n ? '' : 'disabled'}>${ICONS.trash}${onPhone ? 'מחק' : 'העבר לפח'}</button>
+    <span class="spacer"></span>
+    <button class="icon-btn" data-act="refresh" title="רענן (⌘R)">${ICONS.refresh}</button>`;
 }
 
-function renderStatus() {
-  const left = $('#status-left');
-  const right = $('#status-right');
-  left.textContent = '';
-  right.textContent = '';
-  if (isDir()) {
-    const sel = selectedEntries();
-    let txt = `${S.shown.length} פריטים`;
+function renderStatus(p) {
+  p.statusLeft.textContent = '';
+  p.statusRight.textContent = '';
+  if (isDir(p.loc)) {
+    const sel = selectedEntries(p);
+    let txt = `${p.shown.length} פריטים`;
     if (sel.length) {
       const bytes = sel.filter((e) => !e.isDir).reduce((a, e) => a + (e.size || 0), 0);
       txt += `  ·  נבחרו ${sel.length}${bytes ? ` (${fmtSize(bytes)})` : ''}`;
     }
-    left.textContent = txt;
-    if (isDeviceDir()) {
-      const st = storageFor(S.loc.id, S.loc.path);
-      if (st && st.free != null) right.textContent = `${fmtSize(st.free)} פנויים מתוך ${fmtSize(st.total)}`;
+    p.statusLeft.textContent = txt;
+    if (isDeviceDir(p.loc)) {
+      const st = storageFor(p.loc.id, p.loc.path);
+      if (st && st.free != null) p.statusRight.textContent = `${fmtSize(st.free)} פנויים מתוך ${fmtSize(st.total)}`;
     }
-  } else if (S.loc.type === 'device-root') {
-    const d = device(S.loc.id);
-    if (d && d.android) right.textContent = `Android ${d.android}`;
+  } else if (p.loc.type === 'device-root') {
+    const d = device(p.loc.id);
+    if (d && d.android) p.statusRight.textContent = `Android ${d.android}`;
   }
 }
 
-function renderContent() {
-  const loc = S.loc;
-  thumbObserver.disconnect();
-  contentEl.classList.remove('drop-active');
+function renderContent(p) {
+  const loc = p.loc;
+  const el = p.content;
+  p.observer.disconnect();
+  el.classList.remove('drop-active');
 
-  if (loc.type === 'welcome') return renderWelcome();
+  if (loc.type === 'welcome') return renderWelcome(p);
+  const d = isDeviceLoc(loc) ? device(loc.id) : null;
+  if (isDeviceLoc(loc) && (!d || d.state !== 'device')) return renderDeviceState(p, d);
+  if (loc.type === 'device-root') return renderDrives(p, d);
 
-  const d = loc.kind === 'device' || loc.type === 'device-root' ? device(loc.id) : null;
-  if ((loc.kind === 'device' || loc.type === 'device-root') && (!d || d.state !== 'device')) return renderDeviceState(d);
-  if (loc.type === 'device-root') return renderDrives(d);
-
-  if (S.loading && !S.entries.length) {
-    contentEl.innerHTML = `<div class="empty"><div class="spinner"></div></div>`;
+  if (p.loading && !p.entries.length) {
+    el.innerHTML = `<div class="empty"><div class="spinner"></div></div>`;
     return;
   }
-  if (S.loadError) {
-    contentEl.innerHTML = `<div class="empty"><h2>לא ניתן לפתוח את התיקייה</h2><p>${esc(S.loadError)}</p>
+  if (p.loadError) {
+    el.innerHTML = `<div class="empty"><h2>לא ניתן לפתוח את התיקייה</h2><p>${esc(p.loadError)}</p>
       <p><button class="btn" data-act="refresh">נסה שוב</button></p></div>`;
     return;
   }
-  if (!S.shown.length) {
-    contentEl.innerHTML = `<div class="empty"><p>${S.search ? 'לא נמצאו פריטים' : 'התיקייה ריקה'}</p>
-      ${isDeviceDir() && !S.search ? '<p class="muted">גרור לכאן קבצים מה-Finder כדי להעתיק אותם לטלפון</p>' : ''}</div>`;
+  if (!p.shown.length) {
+    el.innerHTML = `<div class="empty"><p>${p.search ? 'לא נמצאו פריטים' : 'התיקייה ריקה'}</p>
+      ${!p.search ? '<p class="muted">גרור לכאן קבצים כדי להעתיק אותם לתיקייה הזו</p>' : ''}</div>`;
     return;
   }
-  if (S.view === 'list') renderList();
-  else renderGrid();
-  observeThumbs();
+  if (S.view === 'list') renderList(p);
+  else renderGrid(p);
+  observeThumbs(p);
 }
 
-function thumbKey(e) {
-  return `${S.loc.kind}|${S.loc.id || ''}|${e.path}|${e.size}|${e.mtime}`;
-}
+const thumbKey = (loc, e) => `${loc.kind}|${loc.id || ''}|${e.path}|${e.size}|${e.mtime}`;
 
-function thumbHtml(e, mini = false) {
-  const cached = S.thumbCache.get(thumbKey(e));
+function thumbHtml(loc, e, mini = false) {
+  const cached = S.thumbCache.get(thumbKey(loc, e));
   const play = !mini && kindOf(e.name) === 'video' ? `<span class="play">${ICONS.play}</span>` : '';
   if (cached) return `<img src="${esc(fileUrl(cached))}" alt="" draggable="false">${play}`;
   return iconFor(e) + play;
 }
 
-function renderGrid() {
-  const html = S.shown
+function renderGrid(p) {
+  const html = p.shown
     .map((e, i) => {
-      const sel = S.selection.has(e.path) ? 'selected' : '';
+      const sel = p.selection.has(e.path) ? 'selected' : '';
       return `<div class="tile ${sel}" data-i="${i}" draggable="true" ${e.isDir ? 'data-drop="folder"' : ''} title="${esc(e.name)}${
-        e.isDir ? '' : '\n' + fmtSize(e.size)
+        e.isDir ? '' : '\n' + fmtSize(e.size) + '\n' + fmtDate(e.mtime)
       }">
-        <div class="thumb" ${isMedia(e) ? 'data-thumb="1"' : ''}>${thumbHtml(e)}</div>
+        <div class="thumb" ${isMedia(e) ? 'data-thumb="1"' : ''}>${thumbHtml(p.loc, e)}</div>
         <div class="name">${esc(e.name)}</div>
       </div>`;
     })
     .join('');
-  contentEl.innerHTML = `<div class="grid">${html}</div>`;
+  p.content.innerHTML = `<div class="grid">${html}</div>`;
 }
 
-function renderList() {
+function renderList(p) {
   const col = (key, label, width) => {
     const sorted = S.sort.key === key;
     return `<th data-sort="${key}" class="${sorted ? 'sorted' : ''} ${sorted && S.sort.dir === 1 ? 'asc' : ''}" style="${width ? `width:${width}` : ''}">${label}</th>`;
   };
-  const rows = S.shown
+  const rows = p.shown
     .map((e, i) => {
-      const sel = S.selection.has(e.path) ? 'selected' : '';
+      const sel = p.selection.has(e.path) ? 'selected' : '';
       return `<tr class="row ${sel}" data-i="${i}" draggable="true" ${e.isDir ? 'data-drop="folder"' : ''}>
-        <td><div class="cell-name"><span class="mini" ${isMedia(e) ? 'data-thumb="1"' : ''}>${thumbHtml(e, true)}</span><span class="name">${esc(e.name)}</span></div></td>
+        <td><div class="cell-name"><span class="mini" ${isMedia(e) ? 'data-thumb="1"' : ''}>${thumbHtml(p.loc, e, true)}</span><span class="name">${esc(e.name)}</span></div></td>
         <td class="date">${fmtDate(e.mtime)}</td>
         <td>${e.isDir ? 'תיקייה' : KIND_LABEL[kindOf(e.name)]}</td>
         <td class="num">${e.isDir ? '' : fmtSize(e.size)}</td>
       </tr>`;
     })
     .join('');
-  contentEl.innerHTML = `<table class="list"><thead><tr>${col('name', 'שם')}${col('mtime', 'תאריך שינוי', '150px')}${col(
+  p.content.innerHTML = `<table class="list"><thead><tr>${col('name', 'שם')}${col('mtime', 'תאריך שינוי', '140px')}${col(
     'kind',
     'סוג',
-    '100px'
-  )}${col('size', 'גודל', '90px')}</tr></thead><tbody>${rows}</tbody></table>`;
+    '80px'
+  )}${col('size', 'גודל', '80px')}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 
-async function renderDrives(d) {
+async function renderDrives(p, d) {
   const sts = S.storages[d.id];
   if (!sts) {
-    contentEl.innerHTML = `<div class="empty"><div class="spinner"></div></div>`;
+    p.content.innerHTML = `<div class="empty"><div class="spinner"></div></div>`;
     return;
   }
   const drives = sts
@@ -573,10 +652,8 @@ async function renderDrives(d) {
       </div>`;
     })
     .join('');
-  contentEl.innerHTML = `<div class="drives"><h2>${esc(d.name)}</h2>${drives}
-    ${finderCardHtml(d)}
-    <div class="shortcuts" id="shortcuts"></div></div>`;
-  contentEl.querySelectorAll('.drive').forEach((el) => (el._loc = { type: 'dir', kind: 'device', id: d.id, path: sts[Number(el.dataset.drive)].path }));
+  p.content.innerHTML = `<div class="drives"><h2>${esc(d.name)}</h2>${drives}<div class="shortcuts"></div></div>`;
+  p.content.querySelectorAll('.drive').forEach((el) => (el._loc = { type: 'dir', kind: 'device', id: d.id, path: sts[Number(el.dataset.drive)].path }));
 
   // Quick links to the folders people usually want.
   const candidates = [
@@ -588,20 +665,20 @@ async function renderDrives(d) {
     { label: 'WhatsApp', path: `${INTERNAL_ROOT}/WhatsApp/Media` },
     { label: 'מסמכים', path: `${INTERNAL_ROOT}/Documents` },
   ];
-  const gen = S.gen;
+  const gen = p.gen;
   const exists = new Set();
   const parents = [...new Set(candidates.map((c) => dirname(c.path)))];
   await Promise.all(
-    parents.map(async (p) => {
+    parents.map(async (dir) => {
       try {
-        for (const e of await api.readdir({ kind: 'device', id: d.id, path: p })) if (e.isDir) exists.add(e.path);
+        for (const e of await api.readdir({ kind: 'device', id: d.id, path: dir })) if (e.isDir) exists.add(e.path);
       } catch {}
     })
   );
-  if (gen !== S.gen) return;
+  if (gen !== p.gen) return;
   const seen = new Set();
   const found = candidates.filter((c) => exists.has(c.path) && !seen.has(c.label) && seen.add(c.label));
-  const box = $('#shortcuts');
+  const box = p.content.querySelector('.shortcuts');
   if (!box || !found.length) return;
   box.innerHTML = `<h2>תיקיות נפוצות</h2><div class="grid">${found
     .map((c, i) => `<div class="tile" data-shortcut="${i}" data-drop="shortcut"><div class="thumb">${FOLDER_SVG}</div><div class="name">${esc(c.label)}</div></div>`)
@@ -609,59 +686,9 @@ async function renderDrives(d) {
   box.querySelectorAll('[data-shortcut]').forEach((el) => (el._loc = { type: 'dir', kind: 'device', id: d.id, path: found[Number(el.dataset.shortcut)].path }));
 }
 
-function finderCardHtml(d) {
-  if (!S.finder.supported) return '';
-  const st = S.finder.mounts[d.id] || {};
-  let status;
-  let buttons;
-  if (st.busy) {
-    status = 'מחבר ל-Finder…';
-    buttons = '<div class="spinner small"></div>';
-  } else if (st.mounted) {
-    status = `מופיע ב-Finder תחת "מיקומים" בשם "${esc(d.name)}"`;
-    buttons = `<button class="btn primary" data-act="finder-open">${ICONS.finder}פתח ב-Finder</button>
-      <button class="btn" data-act="finder-unmount">נתק מ-Finder</button>`;
-  } else {
-    status = 'הצג את הטלפון ככונן רגיל בתוך Finder';
-    buttons = `<button class="btn primary" data-act="finder-mount">${ICONS.finder}הצג ב-Finder</button>`;
-  }
-  return `<div class="finder-card" id="finder-card">
-    <div class="finder-main">
-      <div class="finder-icon">${ICONS.finder}</div>
-      <div class="info"><div class="title">הטלפון ב-Finder</div><div class="muted">${status}</div></div>
-      <div class="finder-buttons">${buttons}</div>
-    </div>
-    <label class="check"><input type="checkbox" data-setting="autoMountFinder" ${S.finder.settings.autoMountFinder ? 'checked' : ''}>
-      חבר ל-Finder אוטומטית בכל פעם שמחברים טלפון</label>
-  </div>`;
-}
-
-function refreshFinderCard() {
-  const card = $('#finder-card');
-  const d = S.loc.type === 'device-root' ? device(S.loc.id) : null;
-  if (card && d) card.outerHTML = finderCardHtml(d);
-}
-
-async function finderAction(act) {
-  const id = S.loc.id;
-  try {
-    if (act === 'finder-mount') {
-      await api.finderMount(id);
-      await api.finderReveal(id, null);
-    } else if (act === 'finder-unmount') {
-      await api.finderUnmount(id);
-    } else {
-      toast('פותח ב-Finder…');
-      await api.finderReveal(id, isDeviceDir() ? S.loc.path : null);
-    }
-  } catch (err) {
-    toast(`Finder: ${errMsg(err)}`, true);
-  }
-}
-
-function renderWelcome() {
+function renderWelcome(p) {
   if (S.adbError && S.adbError.code === 'NO_ADB') {
-    contentEl.innerHTML = `<div class="empty">
+    p.content.innerHTML = `<div class="empty">
       <div class="big-icon">${ICONS.usb}</div>
       <h2>לא נמצא רכיב ADB</h2>
       <p>האפליקציה צריכה את הכלי adb של Google כדי לדבר עם הטלפון.</p>
@@ -670,29 +697,29 @@ function renderWelcome() {
     </div>`;
     return;
   }
-  contentEl.innerHTML = `<div class="empty">
+  p.content.innerHTML = `<div class="empty">
     <div class="big-icon">${ICONS.usb}</div>
     <h2>חבר טלפון אנדרואיד בכבל USB</h2>
     <p>ברגע שהטלפון יתחבר הוא יופיע כאן, ותוכל להיכנס אליו כמו לכל תיקייה.</p>
     <ol class="steps">
       <li>בטלפון: <b>הגדרות ← אודות הטלפון</b> ← לחץ 7 פעמים על <b>מספר Build</b> (בסמסונג: מידע על התוכנה).</li>
       <li>חזור להגדרות ← <b>אפשרויות מפתח</b> ← הפעל <b>ניפוי באגים ב-USB</b>.</li>
-      <li>חבר את הכבל, ובחלון שקופץ בטלפון לחץ <b>אפשר</b> (מומלץ לסמן "אפשר תמיד ממחשב זה").</li>
+      <li>חבר את הכבל, בחר בטלפון <b>העברת קבצים</b>, ובחלון שקופץ לחץ <b>אפשר</b> (מומלץ לסמן "אפשר תמיד ממחשב זה").</li>
     </ol>
     <p class="muted" style="margin-top:14px">טיפ: כבל USB-C איכותי ויציאה ישירה במחשב (לא דרך מפצל) נותנים את המהירות הגבוהה ביותר.</p>
   </div>`;
 }
 
-function renderDeviceState(d) {
+function renderDeviceState(p, d) {
   if (!d) {
-    contentEl.innerHTML = `<div class="empty"><div class="big-icon">${ICONS.phone}</div><h2>המכשיר נותק</h2><p>חבר אותו שוב כדי להמשיך.</p></div>`;
+    p.content.innerHTML = `<div class="empty"><div class="big-icon">${ICONS.phone}</div><h2>המכשיר נותק</h2><p>חבר אותו שוב כדי להמשיך.</p></div>`;
   } else if (d.state === 'unauthorized') {
-    contentEl.innerHTML = `<div class="empty"><div class="big-icon">${ICONS.phone}</div>
+    p.content.innerHTML = `<div class="empty"><div class="big-icon">${ICONS.phone}</div>
       <h2>אשר את החיבור בטלפון</h2>
       <p>בטלפון הופיעה הודעה <b>"לאפשר ניפוי באגים ב-USB?"</b>. סמן "אפשר תמיד ממחשב זה" ולחץ <b>אפשר</b>.</p>
       <p class="muted">לא רואה הודעה? נתק וחבר את הכבל, או בטל ואשר מחדש את "ניפוי באגים ב-USB".</p></div>`;
   } else {
-    contentEl.innerHTML = `<div class="empty"><div class="spinner"></div><p style="margin-top:12px">מתחבר ל-${esc(d.name)}…</p></div>`;
+    p.content.innerHTML = `<div class="empty"><div class="spinner"></div><p style="margin-top:12px">מתחבר ל-${esc(d.name)}…</p></div>`;
   }
 }
 
@@ -700,99 +727,117 @@ function renderDeviceState(d) {
 // Thumbnails (loaded lazily as tiles scroll into view)
 // ---------------------------------------------------------------------------
 
-const thumbObserver = new IntersectionObserver(
-  (items) => {
-    for (const it of items) {
-      if (!it.isIntersecting) continue;
-      thumbObserver.unobserve(it.target);
-      requestThumb(it.target);
-    }
-  },
-  { root: contentEl, rootMargin: '300px' }
-);
-
-function observeThumbs() {
-  contentEl.querySelectorAll('[data-thumb]').forEach((el) => {
-    const row = el.closest('[data-i]');
-    const e = S.shown[Number(row.dataset.i)];
-    if (e && !S.thumbCache.has(thumbKey(e))) thumbObserver.observe(el);
+function observeThumbs(p) {
+  p.content.querySelectorAll('[data-thumb]').forEach((el) => {
+    const e = p.shown[Number(el.closest('[data-i]').dataset.i)];
+    if (e && !S.thumbCache.has(thumbKey(p.loc, e))) p.observer.observe(el);
   });
 }
 
-async function requestThumb(el) {
+async function requestThumb(p, el) {
   const row = el.closest('[data-i]');
   if (!row) return;
-  const e = S.shown[Number(row.dataset.i)];
-  const gen = S.gen;
-  const loc = fsLoc();
-  const p = await api.thumb(loc, e, gen);
-  if (!p) return;
-  S.thumbCache.set(`${loc.kind}|${loc.id || ''}|${e.path}|${e.size}|${e.mtime}`, p);
-  if (gen !== S.gen || !el.isConnected) return;
-  el.innerHTML = thumbHtml(e, el.classList.contains('mini'));
+  const e = p.shown[Number(row.dataset.i)];
+  const gen = p.gen;
+  const loc = p.loc;
+  const file = await api.thumb(fsLoc(loc), e, gen);
+  if (!file) return;
+  S.thumbCache.set(thumbKey(loc, e), file);
+  if (gen !== p.gen || !el.isConnected) return;
+  el.innerHTML = thumbHtml(loc, e, el.classList.contains('mini'));
 }
 
 // ---------------------------------------------------------------------------
 // Selection
 // ---------------------------------------------------------------------------
 
-function updateSelectionUI() {
-  contentEl.querySelectorAll('[data-i]').forEach((el) => {
-    const e = S.shown[Number(el.dataset.i)];
-    el.classList.toggle('selected', Boolean(e && S.selection.has(e.path)));
+function setActive(p) {
+  if (!S.split || S.activeIdx === p.idx) return;
+  S.activeIdx = p.idx;
+  $('#search').value = p.search;
+  renderSidebar();
+  renderToolbar();
+  renderActionbar();
+}
+
+function updateSelectionUI(p) {
+  p.content.querySelectorAll('[data-i]').forEach((el) => {
+    const e = p.shown[Number(el.dataset.i)];
+    el.classList.toggle('selected', Boolean(e && p.selection.has(e.path)));
   });
   renderActionbar();
-  renderStatus();
+  renderStatus(p);
+  schedulePrepare(p);
 }
 
-function selectIndex(i, { toggle = false, range = false } = {}) {
-  const e = S.shown[i];
+function selectIndex(p, i, { toggle = false, range = false } = {}) {
+  const e = p.shown[i];
   if (!e) return;
-  if (range && S.anchor != null) {
-    const a = Math.min(S.anchor, i);
-    const b = Math.max(S.anchor, i);
-    if (!toggle) S.selection.clear();
-    for (let k = a; k <= b; k++) S.selection.add(S.shown[k].path);
+  if (range && p.anchor != null) {
+    const a = Math.min(p.anchor, i);
+    const b = Math.max(p.anchor, i);
+    if (!toggle) p.selection.clear();
+    for (let k = a; k <= b; k++) p.selection.add(p.shown[k].path);
   } else if (toggle) {
-    if (S.selection.has(e.path)) S.selection.delete(e.path);
-    else S.selection.add(e.path);
-    S.anchor = i;
+    if (p.selection.has(e.path)) p.selection.delete(e.path);
+    else p.selection.add(e.path);
+    p.anchor = i;
   } else {
-    S.selection = new Set([e.path]);
-    S.anchor = i;
+    p.selection = new Set([e.path]);
+    p.anchor = i;
   }
-  updateSelectionUI();
+  updateSelectionUI(p);
 }
 
-function focusIndex() {
-  if (S.anchor != null && S.selection.has(S.shown[S.anchor]?.path)) return S.anchor;
-  const i = S.shown.findIndex((e) => S.selection.has(e.path));
-  return i;
+function focusIndex(p) {
+  if (p.anchor != null && p.selection.has(p.shown[p.anchor]?.path)) return p.anchor;
+  return p.shown.findIndex((e) => p.selection.has(e.path));
 }
 
-function scrollIntoView(i) {
-  const el = contentEl.querySelector(`[data-i="${i}"]`);
+function scrollIntoView(p, i) {
+  const el = p.content.querySelector(`[data-i="${i}"]`);
   if (el) el.scrollIntoView({ block: 'nearest' });
+}
+
+// ---------------------------------------------------------------------------
+// Background preparation for dragging phone files straight to the Mac
+// ---------------------------------------------------------------------------
+
+const selectionKey = (loc, entries) => entries.map((e) => thumbKey(loc, e)).sort().join('\n');
+let prepareTimer = null;
+
+/** Copy the selected phone items to temp files shortly after they are selected. */
+function schedulePrepare(p) {
+  clearTimeout(prepareTimer);
+  if (!isDeviceDir(p.loc)) return;
+  const entries = selectedEntries(p);
+  if (!entries.length) return;
+  const key = selectionKey(p.loc, entries);
+  if (S.prepared.has(key)) return;
+  if (entries.filter((e) => !e.isDir).reduce((a, e) => a + e.size, 0) > PREPARE_LIMIT) return;
+  const loc = fsLoc(p.loc);
+  prepareTimer = setTimeout(async () => {
+    try {
+      const files = await api.prepareDrag(loc, entries, PREPARE_LIMIT);
+      if (files) S.prepared.set(key, files);
+    } catch {}
+  }, 350);
 }
 
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
 
-function openEntry(e) {
-  if (e.isDir) {
-    navigate({ ...S.loc, path: e.path });
-  } else if (isMedia(e)) {
-    openViewer(e);
-  } else {
-    openExternal(e);
-  }
+function openEntry(p, e) {
+  if (e.isDir) navigate(p, { ...p.loc, path: e.path });
+  else if (isMedia(e)) openViewer(p, e);
+  else openExternal(p, e);
 }
 
-async function openExternal(e) {
-  if (!isLocalDir()) toast(`פותח את ${e.name}…`);
+async function openExternal(p, e) {
+  if (!isLocalDir(p.loc)) toast(`פותח את ${e.name}…`);
   try {
-    await api.open(fsLoc(), e);
+    await api.open(fsLoc(p.loc), e);
   } catch (err) {
     toast(errMsg(err), true);
   }
@@ -807,11 +852,10 @@ function transferTitle(from, to, count) {
 
 async function startTransfer(from, paths, to) {
   if (!paths.length) return;
-  if (from.kind === to.kind && from.id === to.id && paths.some((p) => to.path === p || to.path.startsWith(p + '/'))) {
-    toast('לא ניתן להעתיק תיקייה לתוך עצמה', true);
-    return;
+  if (from.kind === to.kind && (from.id || null) === (to.id || null)) {
+    if (paths.some((x) => to.path === x || to.path.startsWith(x + '/'))) return toast('לא ניתן להעתיק תיקייה לתוך עצמה', true);
   }
-  const meta = { title: transferTitle(from, to, paths.length), dstKey: JSON.stringify({ kind: to.kind, id: to.id, path: to.path }) };
+  const meta = { title: transferTitle(from, to, paths.length), dst: { kind: to.kind, id: to.id, path: to.path } };
   try {
     await api.startTransfer({ from: { kind: from.kind, id: from.id }, items: paths, to: { kind: to.kind, id: to.id, path: to.path }, meta });
     $('#transfers').classList.remove('hidden');
@@ -820,69 +864,75 @@ async function startTransfer(from, paths, to) {
   }
 }
 
-async function copyToMac(entries = selectedEntries()) {
+function copyToOther(p) {
+  const o = otherPane(p);
+  const sel = selectedEntries(p);
+  if (!o || !isDir(o.loc) || !sel.length) return;
+  startTransfer(p.loc, sel.map((e) => e.path), fsLoc(o.loc));
+}
+
+async function copyToMac(p, entries = selectedEntries(p)) {
   if (!entries.length) return;
   const dir = await api.chooseFolder(`לאן להעתיק ${entries.length === 1 ? `את "${entries[0].name}"` : `${entries.length} פריטים`}?`);
   if (!dir) return;
-  startTransfer(fsLoc(), entries.map((e) => e.path), { kind: 'local', path: dir });
+  startTransfer(p.loc, entries.map((e) => e.path), { kind: 'local', path: dir });
 }
 
 function phoneTarget() {
   const d = readyDevices()[0];
   if (!d) return null;
-  return { kind: 'device', id: d.id, path: S.lastDeviceDir[d.id] || joinPath(INTERNAL_ROOT, 'Download') };
+  return { type: 'dir', kind: 'device', id: d.id, path: S.lastDeviceDir[d.id] || joinPath(INTERNAL_ROOT, 'Download') };
 }
 
-function copyToPhone(entries = selectedEntries()) {
+function copyToPhone(p) {
   const to = phoneTarget();
   if (!to) return toast('לא מחובר טלפון', true);
-  startTransfer(fsLoc(), entries.map((e) => e.path), to);
+  startTransfer(p.loc, selectedEntries(p).map((e) => e.path), fsLoc(to));
 }
 
-async function addFromMac() {
+async function addFromMac(p) {
   const files = await api.chooseFiles('בחר קבצים או תיקיות להעתקה לטלפון');
-  if (files.length) startTransfer({ kind: 'local' }, files, fsLoc());
+  if (files.length) startTransfer({ kind: 'local' }, files, fsLoc(p.loc));
 }
 
-function copySelection() {
-  const sel = selectedEntries();
+function copySelection(p) {
+  const sel = selectedEntries(p);
   if (!sel.length) return;
-  S.clipboard = { from: { kind: S.loc.kind, id: S.loc.id }, paths: sel.map((e) => e.path), at: Date.now() };
+  S.clipboard = { from: { kind: p.loc.kind, id: p.loc.id }, paths: sel.map((e) => e.path) };
   toast(sel.length === 1 ? `"${sel[0].name}" הועתק. עבור לתיקייה אחרת ולחץ ⌘V` : `${sel.length} פריטים הועתקו. עבור לתיקייה אחרת ולחץ ⌘V`);
   renderActionbar();
 }
 
-async function paste() {
-  if (!isDir()) return;
+async function paste(p) {
+  if (!isDir(p.loc)) return;
   // Files copied in Finder take part too, so ⌘C in Finder + ⌘V here sends them to the phone.
   const finder = await api.finderClipboard();
   if (finder.length && (!S.clipboard || S.clipboard.from.kind === 'local')) {
-    const sameAsInternal = S.clipboard && finder.every((p) => S.clipboard.paths.includes(p));
-    if (!sameAsInternal) return startTransfer({ kind: 'local' }, finder, fsLoc());
+    const sameAsInternal = S.clipboard && finder.every((x) => S.clipboard.paths.includes(x));
+    if (!sameAsInternal) return startTransfer({ kind: 'local' }, finder, fsLoc(p.loc));
   }
-  if (!S.clipboard) return;
-  startTransfer(S.clipboard.from, S.clipboard.paths, fsLoc());
+  if (S.clipboard) startTransfer(S.clipboard.from, S.clipboard.paths, fsLoc(p.loc));
 }
 
-async function newFolder() {
+async function newFolder(p) {
   try {
-    const p = await api.mkdir(fsLoc(), 'תיקייה חדשה');
-    await reload();
-    const i = S.shown.findIndex((e) => e.path === p);
+    const created = await api.mkdir(fsLoc(p.loc), 'תיקייה חדשה');
+    await reload(p);
+    const i = p.shown.findIndex((e) => e.path === created);
     if (i >= 0) {
-      selectIndex(i);
-      scrollIntoView(i);
-      startRename(i);
+      selectIndex(p, i);
+      scrollIntoView(p, i);
+      startRename(p, i);
     }
   } catch (err) {
     toast(errMsg(err), true);
   }
 }
 
-async function deleteSelection() {
-  const sel = selectedEntries();
+async function deleteSelection(p) {
+  const sel = selectedEntries(p);
   if (!sel.length) return;
-  const onPhone = isDeviceDir();
+  const onPhone = isDeviceDir(p.loc);
   const what = sel.length === 1 ? `"${sel[0].name}"` : `${sel.length} פריטים`;
   const ok = await api.confirm(
     onPhone
@@ -891,19 +941,18 @@ async function deleteSelection() {
   );
   if (!ok) return;
   try {
-    await api.remove(fsLoc(), sel.map((e) => e.path));
+    await api.remove(fsLoc(p.loc), sel.map((e) => e.path));
     toast(onPhone ? 'נמחק' : 'הועבר לפח');
   } catch (err) {
     toast(errMsg(err), true);
   }
-  reload();
+  reloadWhere(p.loc);
 }
 
-function startRename(i) {
-  const e = S.shown[i];
-  const el = contentEl.querySelector(`[data-i="${i}"] .name`);
+function startRename(p, i) {
+  const e = p.shown[i];
+  const el = p.content.querySelector(`[data-i="${i}"] .name`);
   if (!e || !el) return;
-  S.renaming = e.path;
   const input = document.createElement('input');
   input.className = 'rename-input';
   input.value = e.name;
@@ -915,18 +964,17 @@ function startRename(i) {
   const finish = async (commit) => {
     if (done) return;
     done = true;
-    S.renaming = null;
     const name = input.value.trim();
     if (commit && name && name !== e.name) {
       try {
-        const to = await api.rename(fsLoc(), e.path, name);
-        S.selection = new Set([to]);
+        const to = await api.rename(fsLoc(p.loc), e.path, name);
+        p.selection = new Set([to]);
       } catch (err) {
         toast(errMsg(err), true);
       }
     }
-    await reload();
-    contentEl.focus();
+    reloadWhere(p.loc);
+    p.content.focus();
   };
   input.addEventListener('keydown', (ev) => {
     ev.stopPropagation();
@@ -938,52 +986,51 @@ function startRename(i) {
   input.addEventListener('dblclick', (ev) => ev.stopPropagation());
 }
 
-function runAction(act) {
+function runAction(act, p = active()) {
   switch (act) {
+    case 'copy-to-other':
+      return copyToOther(p);
     case 'copy-to-mac':
-      return copyToMac();
+      return copyToMac(p);
     case 'copy-to-phone':
-      return copyToPhone();
+      return copyToPhone(p);
     case 'add-from-mac':
-      return addFromMac();
+      return addFromMac(p);
     case 'new-folder':
-      return newFolder();
+      return newFolder(p);
     case 'copy':
-      return copySelection();
+      return copySelection(p);
     case 'paste':
-      return paste();
+      return paste(p);
     case 'delete':
-      return deleteSelection();
+      return deleteSelection(p);
     case 'refresh':
-      return reload();
-    case 'finder-open':
-    case 'finder-mount':
-    case 'finder-unmount':
-      return finderAction(act);
+      return reload(p);
   }
 }
 
-async function showContextMenu(ev) {
-  if (!isDir()) return;
+async function showContextMenu(p, ev) {
+  if (!isDir(p.loc)) return;
   const row = ev.target.closest('[data-i]');
   if (row) {
     const i = Number(row.dataset.i);
-    if (!S.selection.has(S.shown[i].path)) selectIndex(i);
-  } else {
-    S.selection.clear();
-    updateSelectionUI();
+    if (!p.selection.has(p.shown[i].path)) selectIndex(p, i);
+  } else if (p.selection.size) {
+    p.selection.clear();
+    updateSelectionUI(p);
   }
-  const sel = selectedEntries();
+  const sel = selectedEntries(p);
   const one = sel.length === 1 ? sel[0] : null;
-  const onPhone = isDeviceDir();
-  const hasPhone = readyDevices().length > 0;
+  const onPhone = isDeviceDir(p.loc);
+  const o = otherPane(p);
   const tpl = [];
   if (sel.length) {
     if (one) tpl.push({ id: 'open', label: one.isDir ? 'פתח' : isMedia(one) ? 'הצג' : 'פתח' });
     if (one && !one.isDir) tpl.push({ id: 'open-external', label: 'פתח באפליקציה ברירת מחדל' });
     tpl.push({ type: 'separator' });
+    if (o && isDir(o.loc) && !sameDir(o.loc, p.loc)) tpl.push({ id: 'copy-to-other', label: `העתק אל ${locTitle(o.loc)}`, accelerator: 'F5' });
     if (onPhone) tpl.push({ id: 'copy-to-mac', label: 'העתק למחשב…' });
-    else tpl.push({ id: 'copy-to-phone', label: 'העתק לטלפון', enabled: hasPhone });
+    else tpl.push({ id: 'copy-to-phone', label: 'העתק לטלפון', enabled: readyDevices().length > 0 });
     tpl.push({ id: 'copy', label: 'העתק', accelerator: 'CmdOrCtrl+C' });
     tpl.push({ type: 'separator' });
     if (one) tpl.push({ id: 'rename', label: 'שנה שם', accelerator: 'F2' });
@@ -999,41 +1046,43 @@ async function showContextMenu(ev) {
   }
   const id = await api.popupMenu(tpl);
   if (!id) return;
-  if (id === 'open') openEntry(one);
-  else if (id === 'open-external') openExternal(one);
-  else if (id === 'rename') startRename(S.shown.indexOf(one));
+  if (id === 'open') openEntry(p, one);
+  else if (id === 'open-external') openExternal(p, one);
+  else if (id === 'rename') startRename(p, p.shown.indexOf(one));
   else if (id === 'reveal') api.reveal(one.path);
   else if (id === 'toggle-hidden') {
     store('hidden', showHidden() ? '0' : '1');
-    applyView();
-    renderContent();
-    renderStatus();
-  } else runAction(id);
+    for (const x of visiblePanes()) {
+      applyView(x);
+      renderContent(x);
+      renderStatus(x);
+    }
+  } else runAction(id, p);
 }
 
 // ---------------------------------------------------------------------------
 // Viewer (in-app photo / video preview with next / previous)
 // ---------------------------------------------------------------------------
 
-function openViewer(entry) {
-  const list = S.shown.filter(isMedia);
-  S.viewer = { list, index: list.indexOf(entry), loc: fsLoc(), token: 0 };
+function openViewer(p, entry) {
+  const list = p.shown.filter(isMedia);
+  S.viewer = { pane: p, list, index: list.indexOf(entry), loc: p.loc, token: 0 };
   $('#viewer').classList.remove('hidden');
   showViewerItem();
 }
 
 function closeViewer() {
   if (!S.viewer) return;
-  const cur = S.viewer.list[S.viewer.index];
+  const { pane, list, index } = S.viewer;
   S.viewer = null;
   $('#viewer-stage').innerHTML = '';
   $('#viewer').classList.add('hidden');
-  const i = S.shown.indexOf(cur);
+  const i = pane.shown.indexOf(list[index]);
   if (i >= 0) {
-    selectIndex(i);
-    scrollIntoView(i);
+    selectIndex(pane, i);
+    scrollIntoView(pane, i);
   }
-  contentEl.focus();
+  pane.content.focus();
 }
 
 async function showViewerItem() {
@@ -1046,30 +1095,30 @@ async function showViewerItem() {
   $('#viewer-next').disabled = v.index >= v.list.length - 1;
   $('#viewer-copy').classList.toggle('hidden', v.loc.kind !== 'device');
   const stage = $('#viewer-stage');
-  const cached = S.thumbCache.get(`${v.loc.kind}|${v.loc.id || ''}|${e.path}|${e.size}|${e.mtime}`);
+  const cached = S.thumbCache.get(thumbKey(v.loc, e));
   // Show the thumbnail immediately while the full file loads.
   stage.innerHTML = cached ? `<img src="${esc(fileUrl(cached))}" style="filter:blur(2px)">` : `<div class="spinner"></div>`;
   try {
-    const p = await api.preview(v.loc, e);
+    const file = await api.preview(fsLoc(v.loc), e);
     if (!S.viewer || token !== v.token) return;
-    const url = fileUrl(p);
+    const url = fileUrl(file);
     if (kindOf(e.name) === 'video') {
       stage.innerHTML = `<video src="${esc(url)}" controls autoplay></video>`;
       stage.querySelector('video').addEventListener('error', () => {
         stage.innerHTML = `<div class="viewer-msg">לא ניתן לנגן את הסרטון כאן.<br><br><button class="btn" id="viewer-fallback">פתח ב-QuickTime</button></div>`;
-        $('#viewer-fallback').onclick = () => api.open(v.loc, e);
+        $('#viewer-fallback').onclick = () => api.open(fsLoc(v.loc), e);
       });
     } else {
       const img = new Image();
       img.onload = () => token === v.token && stage.replaceChildren(img);
-      img.onerror = async () => {
-        // Formats Chromium cannot draw (HEIC, DNG): fall back to a large Quick Look thumbnail if we have one.
+      img.onerror = () => {
+        // Formats Chromium cannot draw (HEIC, DNG): fall back to the Quick Look thumbnail if we have one.
         if (token !== v.token) return;
         stage.innerHTML = cached
           ? `<img src="${esc(fileUrl(cached))}">`
           : `<div class="viewer-msg">אין תצוגה מקדימה לקובץ הזה.<br><br><button class="btn" id="viewer-fallback">פתח ב-Preview</button></div>`;
         const fb = $('#viewer-fallback');
-        if (fb) fb.onclick = () => api.open(v.loc, e);
+        if (fb) fb.onclick = () => api.open(fsLoc(v.loc), e);
       };
       img.src = url;
     }
@@ -1104,10 +1153,10 @@ function renderTransfers() {
         line = `${fmtSize(j.doneBytes)} מתוך ${fmtSize(j.totalBytes)}${j.speed ? ` · ${fmtSize(j.speed)}/שנ׳` : ''}${eta ? ` · נותרו ${fmtDuration(eta)}` : ''}`;
       } else if (j.state === 'done') line = `הושלם · ${j.filesDone} קבצים · ${fmtSize(j.totalBytes)}`;
       else if (j.state === 'cancelled') line = 'בוטל';
-      const active = ['queued', 'scanning', 'running'].includes(j.state);
+      const running = ['queued', 'scanning', 'running'].includes(j.state);
       return `<div class="transfer ${j.state}">
         <div class="row1"><span class="title">${esc(j.meta.title || 'העברה')}</span>
-          ${active ? `<button class="link-btn" data-cancel="${j.id}">ביטול</button>` : ''}</div>
+          ${running ? `<button class="link-btn" data-cancel="${j.id}">ביטול</button>` : ''}</div>
         <div class="bar"><div style="width:${pct}%"></div></div>
         <div class="muted">${esc(line)}</div>
         ${j.state === 'running' && j.current ? `<div class="muted current">${esc(j.current)} (${j.filesDone + 1}/${j.filesTotal})</div>` : ''}
@@ -1126,8 +1175,8 @@ function onTransferUpdate(job) {
   if (!finished) return;
   if (job.state === 'done') toast(`ההעתקה הושלמה: ${job.meta.title}`);
   if (job.state === 'error') toast(`ההעתקה נכשלה: ${job.error}`, true);
-  // Refresh the folder if it received files.
-  if (isDir() && job.meta.dstKey === JSON.stringify({ kind: S.loc.kind, id: S.loc.id, path: S.loc.path })) reload();
+  // Show the new files in any pane looking at the destination.
+  if (job.meta.dst) reloadWhere({ type: 'dir', ...job.meta.dst });
 }
 
 function modal({ title, text, buttons, checkbox }) {
@@ -1169,64 +1218,26 @@ async function onConflict(c) {
 
 /** Where would a drop on `el` copy to? */
 function dropTargetFor(el) {
-  const t = el && el.closest('[data-drop]');
+  const t = el && el.closest && el.closest('[data-drop]');
+  const p = paneOf(el);
   if (t) {
     const kind = t.dataset.drop;
-    if (kind === 'folder') {
-      const e = S.shown[Number(t.dataset.i)];
-      return { el: t, loc: { kind: S.loc.kind, id: S.loc.id, path: e.path } };
+    if (kind === 'folder' && p) {
+      const e = p.shown[Number(t.dataset.i)];
+      if (e) return { el: t, loc: { kind: p.loc.kind, id: p.loc.id, path: e.path } };
     }
     if (kind === 'device') return { el: t, loc: { kind: 'device', id: t.dataset.id, path: t.dataset.path } };
     if (kind === 'local') return { el: t, loc: { kind: 'local', path: t.dataset.path } };
     if (t._loc && t._loc.type === 'dir') return { el: t, loc: fsLoc(t._loc) };
   }
-  if (contentEl.contains(el) && isDir()) return { el: contentEl, loc: fsLoc(), whole: true };
+  if (p && p.content.contains(el) && isDir(p.loc)) return { el: p.content, loc: fsLoc(p.loc), whole: true };
   return null;
 }
 
-let dragSource = null;
+let dragSource = null; // { from, paths }
+let nativeDrag = null; // { from, paths, files }: items handed to the OS as a real file drag
 let dropHighlight = null;
-let nativeDrag = null; // { from, paths, files }: items dragged with a real OS file drag
-let dragToken = 0;
-let mouseIsDown = false;
-// Bigger than this and not already prepared: drag stays inside the app, the copy button handles Finder.
-const NATIVE_DRAG_LIMIT = 500 * 1024 * 1024;
-
 const sameSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
-
-/** Copy phone items to temp files (with a progress toast), then start a real file drag. */
-async function prepareAndDrag(entries, src) {
-  const token = ++dragToken;
-  let toastShown = false;
-  const showTimer = setTimeout(() => {
-    toastShown = true;
-    toast('מכין את הקבצים לגרירה…');
-  }, 250);
-  const off = api.onDragProgress(({ done, total }) => {
-    if (toastShown && token === dragToken && total) toast(`מכין את הקבצים לגרירה… ${Math.floor((done / total) * 100)}%`);
-  });
-  let files;
-  try {
-    files = await api.prepareDrag(fsLoc(), entries);
-  } catch (err) {
-    toast(errMsg(err), true);
-    return;
-  } finally {
-    clearTimeout(showTimer);
-    off();
-  }
-  for (const e of entries) if (!e.isDir) S.preparedDrag.add(thumbKey(e));
-  if (token !== dragToken) return;
-  if (!mouseIsDown) {
-    // The mouse was released while we were copying; the files are cached now, so the next drag is instant.
-    dragSource = null;
-    toast('הקבצים מוכנים. גרור שוב כדי להעביר אותם ל-Finder');
-    return;
-  }
-  if (toastShown) $('#toast').classList.add('hidden');
-  nativeDrag = { ...src, files };
-  api.startDrag(files, S.thumbCache.get(thumbKey(entries[0])) || null);
-}
 
 function clearDropHighlight() {
   if (dropHighlight) dropHighlight.classList.remove('drop-target', 'drop-active');
@@ -1234,41 +1245,39 @@ function clearDropHighlight() {
 }
 
 function setupDnD() {
-  document.addEventListener('mousedown', () => {
-    mouseIsDown = true;
-    nativeDrag = null;
-    dragToken++;
-  }, true);
-  document.addEventListener('mouseup', () => {
-    mouseIsDown = false;
-  }, true);
+  document.addEventListener(
+    'mousedown',
+    () => {
+      nativeDrag = null;
+      dragSource = null;
+    },
+    true
+  );
 
   document.addEventListener('dragstart', (ev) => {
     const row = ev.target.closest && ev.target.closest('[data-i]');
-    if (!row || !isDir()) return;
+    const p = paneOf(ev.target);
+    if (!row || !p || !isDir(p.loc)) return;
     const i = Number(row.dataset.i);
-    if (!S.selection.has(S.shown[i].path)) selectIndex(i);
-    const entries = selectedEntries();
-    dragSource = { from: { kind: S.loc.kind, id: S.loc.id }, paths: entries.map((e) => e.path) };
+    if (!p.selection.has(p.shown[i].path)) selectIndex(p, i);
+    const entries = selectedEntries(p);
+    dragSource = { from: { kind: p.loc.kind, id: p.loc.id }, paths: entries.map((e) => e.path) };
+    const icon = S.thumbCache.get(thumbKey(p.loc, entries[0])) || null;
 
-    // Real OS file drag, so items can be dropped into Finder (or any app) as well as inside this window.
-    if (S.loc.kind === 'local') {
+    // A real OS file drag works everywhere: Finder, the desktop, other apps, and the other pane.
+    const files = p.loc.kind === 'local' ? dragSource.paths : S.prepared.get(selectionKey(p.loc, entries)) || null;
+    if (files) {
       ev.preventDefault();
-      nativeDrag = { ...dragSource, files: dragSource.paths };
-      api.startDrag(dragSource.paths, S.thumbCache.get(thumbKey(entries[0])) || null);
+      nativeDrag = { ...dragSource, files };
+      api.startDrag(files, icon);
       return;
     }
-    const unprepared = entries.filter((e) => e.isDir || !S.preparedDrag.has(thumbKey(e)));
-    const bytes = unprepared.reduce((a, e) => a + (e.isDir ? 0 : e.size || 0), 0);
-    if (bytes <= NATIVE_DRAG_LIMIT) {
-      ev.preventDefault();
-      prepareAndDrag(entries, dragSource);
-      return;
-    }
-    // Very large files: drag within the app only (to a Mac folder in the sidebar).
-    toast('קבצים גדולים: גרור לתיקייה בסרגל הצד, או השתמש ב"העתק למחשב"');
+    // Phone files not ready yet (or very large): drag inside the app, e.g. to the other pane.
     ev.dataTransfer.setData(DRAG_MIME, JSON.stringify(dragSource));
     ev.dataTransfer.effectAllowed = 'copy';
+    const big = entries.filter((e) => !e.isDir).reduce((a, e) => a + e.size, 0) > PREPARE_LIMIT;
+    toast(big ? 'קבצים גדולים: גרור לצד השני או לתיקייה בסרגל, או לחץ "העתק למחשב"' : 'מכין את הקבצים… לגרירה ישירה ל-Finder נסה שוב בעוד רגע');
+    schedulePrepare(p);
   });
   document.addEventListener('dragend', () => {
     dragSource = null;
@@ -1277,15 +1286,14 @@ function setupDnD() {
 
   document.addEventListener('dragover', (ev) => {
     const types = [...ev.dataTransfer.types];
-    const external = types.includes('Files');
-    if (!external && !types.includes(DRAG_MIME)) return;
+    if (!types.includes('Files') && !types.includes(DRAG_MIME)) return;
     const target = dropTargetFor(ev.target);
     let ok = Boolean(target);
     if (ok && dragSource) {
       // Do not drop a folder into itself, or items back into the folder they came from.
       const src = dragSource;
-      const same = src.from.kind === target.loc.kind && src.from.id === target.loc.id;
-      if (same && src.paths.some((p) => target.loc.path === p || target.loc.path.startsWith(p + '/') || dirname(p) === target.loc.path)) ok = false;
+      const same = src.from.kind === target.loc.kind && (src.from.id || null) === (target.loc.id || null);
+      if (same && src.paths.some((x) => target.loc.path === x || target.loc.path.startsWith(x + '/') || dirname(x) === target.loc.path)) ok = false;
     }
     const el = ok ? target.el : null;
     if (el !== dropHighlight) {
@@ -1316,8 +1324,8 @@ function setupDnD() {
     const internal = ev.dataTransfer.getData(DRAG_MIME);
     if (internal) {
       const src = JSON.parse(internal);
-      startTransfer(src.from, src.paths, target.loc);
-      return;
+      dragSource = null;
+      return startTransfer(src.from, src.paths, target.loc);
     }
     const files = [...ev.dataTransfer.files].map((f) => api.pathForFile(f)).filter(Boolean);
     if (!files.length) return;
@@ -1326,8 +1334,7 @@ function setupDnD() {
       const src = nativeDrag;
       nativeDrag = null;
       dragSource = null;
-      startTransfer(src.from, src.paths, target.loc);
-      return;
+      return startTransfer(src.from, src.paths, target.loc);
     }
     startTransfer({ kind: 'local' }, files, target.loc);
   });
@@ -1337,10 +1344,86 @@ function setupDnD() {
 // Events
 // ---------------------------------------------------------------------------
 
+function toggleSplit() {
+  S.split = !S.split;
+  store('split', S.split ? '1' : '0');
+  if (!S.split) S.activeIdx = 0;
+  if (S.split && panes[1].loc.type === 'welcome') navigate(panes[1], defaultMacLoc());
+  renderAll();
+}
+
+function setupPane(p) {
+  const el = p.content;
+  p.el.querySelector('[data-pnav="back"]').innerHTML = ICONS.back;
+  p.el.querySelector('[data-pnav="forward"]').innerHTML = ICONS.forward;
+  p.el.querySelector('[data-pnav="up"]').innerHTML = ICONS.up;
+  p.el.querySelector('.pane-head').addEventListener('click', (ev) => {
+    const nav = ev.target.closest('[data-pnav]');
+    if (nav) {
+      if (nav.dataset.pnav === 'back') goBack(p);
+      else if (nav.dataset.pnav === 'forward') goForward(p);
+      else goUp(p);
+      return;
+    }
+    const c = ev.target.closest('.crumb');
+    if (c && c._loc && !sameLoc(c._loc, p.loc)) navigate(p, c._loc);
+  });
+  // Clicking anywhere in a pane makes it the one the toolbar and sidebar act on.
+  p.el.addEventListener('mousedown', () => setActive(p), true);
+
+  el.addEventListener('mousedown', (ev) => {
+    if (ev.button !== 0) return;
+    const row = ev.target.closest('[data-i]');
+    if (!row) {
+      if (ev.target.closest('th, .drive, [data-shortcut], button')) return;
+      if (p.selection.size) {
+        p.selection.clear();
+        updateSelectionUI(p);
+      }
+      return;
+    }
+    const i = Number(row.dataset.i);
+    const toggle = ev.metaKey || ev.ctrlKey;
+    // Keep a multi-selection when starting to drag one of its items.
+    if (!toggle && !ev.shiftKey && p.selection.has(p.shown[i].path) && p.selection.size > 1) {
+      row._pendingSingle = true;
+      return;
+    }
+    selectIndex(p, i, { toggle, range: ev.shiftKey });
+  });
+  el.addEventListener('click', (ev) => {
+    const row = ev.target.closest('[data-i]');
+    if (row && row._pendingSingle) {
+      row._pendingSingle = false;
+      selectIndex(p, Number(row.dataset.i));
+    }
+    const act = ev.target.closest('[data-act]');
+    if (act) runAction(act.dataset.act, p);
+    const th = ev.target.closest('th[data-sort]');
+    if (th) {
+      const key = th.dataset.sort;
+      setSort(S.sort.key === key ? { key, dir: -S.sort.dir } : { key, dir: key === 'name' || key === 'kind' ? 1 : -1 });
+    }
+    const drive = ev.target.closest('.drive, [data-shortcut]');
+    if (drive) {
+      el.querySelectorAll('.drive.selected').forEach((d) => d.classList.remove('selected'));
+      drive.classList.add('selected');
+    }
+  });
+  el.addEventListener('dblclick', (ev) => {
+    const row = ev.target.closest('[data-i]');
+    if (row) return openEntry(p, p.shown[Number(row.dataset.i)]);
+    const drive = ev.target.closest('.drive, [data-shortcut]');
+    if (drive && drive._loc) navigate(p, drive._loc);
+  });
+  el.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();
+    setActive(p);
+    showContextMenu(p, ev);
+  });
+}
+
 function setupEvents() {
-  $('#btn-back').innerHTML = ICONS.back;
-  $('#btn-forward').innerHTML = ICONS.forward;
-  $('#btn-up').innerHTML = ICONS.up;
   $('#view-grid').innerHTML = ICONS.grid;
   $('#view-list').innerHTML = ICONS.list;
   $('#transfers-close').innerHTML = ICONS.close;
@@ -1348,107 +1431,54 @@ function setupEvents() {
   $('#viewer-prev').innerHTML = ICONS.chevronPrev;
   $('#viewer-next').innerHTML = ICONS.chevronNext;
 
-  $('#btn-back').onclick = goBack;
-  $('#btn-forward').onclick = goForward;
-  $('#btn-up').onclick = goUp;
+  panes.forEach(setupPane);
+  $('#btn-split').onclick = toggleSplit;
+
   const setView = (v) => {
     S.view = v;
     store('view', v);
     renderToolbar();
-    renderContent();
+    for (const p of visiblePanes()) renderContent(p);
   };
   $('#view-grid').onclick = () => setView('grid');
   $('#view-list').onclick = () => setView('list');
+  $('#sort-key').onchange = (ev) => {
+    const key = ev.target.value;
+    setSort({ key, dir: key === 'name' || key === 'kind' ? 1 : -1 });
+  };
+  $('#sort-dir').onclick = () => setSort({ ...S.sort, dir: -S.sort.dir });
 
   $('#search').addEventListener('input', (ev) => {
-    S.search = ev.target.value;
-    applyView();
-    renderContent();
-    renderStatus();
+    const p = active();
+    p.search = ev.target.value;
+    applyView(p);
+    renderContent(p);
+    renderStatus(p);
   });
   $('#search').addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') {
+      const p = active();
       ev.target.value = '';
-      S.search = '';
-      applyView();
-      renderContent();
-      contentEl.focus();
+      p.search = '';
+      applyView(p);
+      renderContent(p);
+      p.content.focus();
     }
-  });
-
-  $('#breadcrumbs').addEventListener('click', (ev) => {
-    const c = ev.target.closest('.crumb');
-    if (c && c._loc && !sameLoc(c._loc, S.loc)) navigate(c._loc);
   });
 
   document.querySelector('.sidebar').addEventListener('click', (ev) => {
     const it = ev.target.closest('[data-nav]');
     if (!it) return;
+    const p = active();
     const nav = it.dataset.nav;
-    if (nav === 'device-root') navigate({ type: 'device-root', id: it.dataset.id });
-    else if (nav === 'device-dir') navigate({ type: 'dir', kind: 'device', id: it.dataset.id, path: it.dataset.path });
-    else if (nav === 'local-dir') navigate({ type: 'dir', kind: 'local', path: it.dataset.path });
+    if (nav === 'device-root') navigate(p, { type: 'device-root', id: it.dataset.id });
+    else if (nav === 'device-dir') navigate(p, { type: 'dir', kind: 'device', id: it.dataset.id, path: it.dataset.path });
+    else if (nav === 'local-dir') navigate(p, { type: 'dir', kind: 'local', path: it.dataset.path });
   });
 
   $('#actionbar').addEventListener('click', (ev) => {
     const b = ev.target.closest('[data-act]');
     if (b && !b.disabled) runAction(b.dataset.act);
-  });
-
-  contentEl.addEventListener('mousedown', (ev) => {
-    if (ev.button !== 0) return;
-    const row = ev.target.closest('[data-i]');
-    if (!row) {
-      if (ev.target.closest('th, .drive, [data-shortcut], button')) return;
-      if (S.selection.size) {
-        S.selection.clear();
-        updateSelectionUI();
-      }
-      return;
-    }
-    const i = Number(row.dataset.i);
-    const toggle = ev.metaKey || ev.ctrlKey;
-    // Keep a multi-selection when starting to drag one of its items.
-    if (!toggle && !ev.shiftKey && S.selection.has(S.shown[i].path) && S.selection.size > 1) {
-      row._pendingSingle = true;
-      return;
-    }
-    selectIndex(i, { toggle, range: ev.shiftKey });
-  });
-  contentEl.addEventListener('click', (ev) => {
-    const row = ev.target.closest('[data-i]');
-    if (row && row._pendingSingle) {
-      row._pendingSingle = false;
-      selectIndex(Number(row.dataset.i));
-    }
-    const act = ev.target.closest('[data-act]');
-    if (act) runAction(act.dataset.act);
-    const th = ev.target.closest('th[data-sort]');
-    if (th) {
-      const key = th.dataset.sort;
-      S.sort = S.sort.key === key ? { key, dir: -S.sort.dir } : { key, dir: key === 'name' || key === 'kind' ? 1 : -1 };
-      applyView();
-      renderContent();
-    }
-    const drive = ev.target.closest('.drive, [data-shortcut]');
-    if (drive) {
-      contentEl.querySelectorAll('.drive.selected').forEach((d) => d.classList.remove('selected'));
-      drive.classList.add('selected');
-    }
-  });
-  contentEl.addEventListener('change', async (ev) => {
-    const key = ev.target.dataset && ev.target.dataset.setting;
-    if (key) S.finder.settings = await api.setSettings({ [key]: ev.target.checked });
-  });
-  contentEl.addEventListener('dblclick', (ev) => {
-    const row = ev.target.closest('[data-i]');
-    if (row) return openEntry(S.shown[Number(row.dataset.i)]);
-    const drive = ev.target.closest('.drive, [data-shortcut]');
-    if (drive && drive._loc) navigate(drive._loc);
-  });
-  contentEl.addEventListener('contextmenu', (ev) => {
-    ev.preventDefault();
-    showContextMenu(ev);
   });
 
   $('#transfer-list').addEventListener('click', (ev) => {
@@ -1465,8 +1495,8 @@ function setupEvents() {
   $('#viewer-close').onclick = closeViewer;
   $('#viewer-prev').onclick = () => viewerStep(-1);
   $('#viewer-next').onclick = () => viewerStep(1);
-  $('#viewer-open').onclick = () => S.viewer && api.open(S.viewer.loc, S.viewer.list[S.viewer.index]).catch((e) => toast(errMsg(e), true));
-  $('#viewer-copy').onclick = () => S.viewer && copyToMac([S.viewer.list[S.viewer.index]]);
+  $('#viewer-open').onclick = () => S.viewer && api.open(fsLoc(S.viewer.loc), S.viewer.list[S.viewer.index]).catch((e) => toast(errMsg(e), true));
+  $('#viewer-copy').onclick = () => S.viewer && copyToMac(S.viewer.pane, [S.viewer.list[S.viewer.index]]);
 
   document.addEventListener('keydown', onKey);
 }
@@ -1482,63 +1512,71 @@ function onKey(ev) {
     ev.preventDefault();
     return;
   }
-  if (ev.target.tagName === 'INPUT') {
+  if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT') {
     if (cmd && ev.key.toLowerCase() === 'f') ev.preventDefault();
     return;
   }
+  const p = active();
 
-  if (cmd && ev.key === '[') return goBack();
-  if (cmd && ev.key === ']') return goForward();
-  if (cmd && ev.key === 'ArrowUp') return goUp();
+  if (ev.key === 'Tab' && S.split) {
+    ev.preventDefault();
+    setActive(otherPane(p));
+    active().content.focus();
+    return;
+  }
+  if (cmd && ev.key === '[') return goBack(p);
+  if (cmd && ev.key === ']') return goForward(p);
+  if (cmd && ev.key === 'ArrowUp') return goUp(p);
   if (cmd && ev.key.toLowerCase() === 'f') {
     ev.preventDefault();
     return $('#search').focus();
   }
   if (cmd && ev.key.toLowerCase() === 'r') {
     ev.preventDefault();
-    return reload();
+    return reload(p);
   }
-  if (!isDir()) return;
+  if (!isDir(p.loc)) return;
 
   if (cmd && ev.key.toLowerCase() === 'a') {
     ev.preventDefault();
-    S.selection = new Set(S.shown.map((e) => e.path));
-    return updateSelectionUI();
+    p.selection = new Set(p.shown.map((e) => e.path));
+    return updateSelectionUI(p);
   }
-  if (cmd && ev.key.toLowerCase() === 'c') return copySelection();
-  if (cmd && ev.key.toLowerCase() === 'v') return paste();
-  if (cmd && ev.shiftKey && ev.key.toLowerCase() === 'n') return newFolder();
-  if (ev.key === 'Delete' || (cmd && ev.key === 'Backspace')) return deleteSelection();
-  if (ev.key === 'Backspace') return goBack();
+  if (cmd && ev.key.toLowerCase() === 'c') return copySelection(p);
+  if (cmd && ev.key.toLowerCase() === 'v') return paste(p);
+  if (cmd && ev.shiftKey && ev.key.toLowerCase() === 'n') return newFolder(p);
+  if (ev.key === 'F5') return copyToOther(p);
+  if (ev.key === 'Delete' || (cmd && ev.key === 'Backspace')) return deleteSelection(p);
+  if (ev.key === 'Backspace') return goBack(p);
   if (ev.key === 'F2') {
-    const i = focusIndex();
-    if (i >= 0) startRename(i);
+    const i = focusIndex(p);
+    if (i >= 0) startRename(p, i);
     return;
   }
   if (ev.key === 'Enter' || (cmd && ev.key === 'ArrowDown')) {
-    const sel = selectedEntries();
-    if (sel.length === 1) openEntry(sel[0]);
+    const sel = selectedEntries(p);
+    if (sel.length === 1) openEntry(p, sel[0]);
     return;
   }
   if (ev.key === ' ') {
     ev.preventDefault();
-    const e = S.shown[focusIndex()];
-    if (e && isMedia(e)) openViewer(e);
+    const e = p.shown[focusIndex(p)];
+    if (e && isMedia(e)) openViewer(p, e);
     return;
   }
   if (ev.key === 'Escape') {
-    S.selection.clear();
-    return updateSelectionUI();
+    p.selection.clear();
+    return updateSelectionUI(p);
   }
   const arrows = { ArrowLeft: 1, ArrowRight: -1, ArrowUp: 'up', ArrowDown: 'down' };
   if (ev.key in arrows) {
     ev.preventDefault();
-    if (!S.shown.length) return;
-    let i = focusIndex();
-    if (i < 0) return selectIndex(0);
+    if (!p.shown.length) return;
+    const i = focusIndex(p);
+    if (i < 0) return selectIndex(p, 0);
     let cols = 1;
     if (S.view === 'grid') {
-      const tiles = contentEl.querySelectorAll('.grid > .tile');
+      const tiles = p.content.querySelectorAll('.grid > .tile');
       const top = tiles[0]?.offsetTop;
       cols = [...tiles].findIndex((t) => t.offsetTop !== top);
       if (cols <= 0) cols = tiles.length;
@@ -1549,10 +1587,11 @@ function onKey(ev) {
     else if (a === 'down') n = i + cols;
     else if (S.view === 'grid') n = i + a;
     else return;
-    n = Math.max(0, Math.min(S.shown.length - 1, n));
-    selectIndex(n, { range: ev.shiftKey });
-    if (ev.shiftKey) S.anchor = S.anchor ?? i;
-    scrollIntoView(n);
+    n = Math.max(0, Math.min(p.shown.length - 1, n));
+    const anchor = p.anchor ?? i;
+    selectIndex(p, n, { range: ev.shiftKey });
+    if (ev.shiftKey) p.anchor = anchor;
+    scrollIntoView(p, n);
   }
 }
 
@@ -1565,27 +1604,26 @@ function onDevices(list) {
   S.devices = list;
   S.adbError = null;
   for (const id of Object.keys(S.storages)) if (!list.some((d) => d.id === id)) delete S.storages[id];
+  const phonePane = panes[0];
+
+  // The second pane goes back to the Mac when the phone it showed is unplugged.
+  if (S.split && isDeviceLoc(panes[1].loc) && !list.some((d) => d.id === panes[1].loc.id)) navigate(panes[1], defaultMacLoc());
 
   // A phone just became ready: go into it, like opening a drive in Explorer.
   const ready = list.find((d) => d.state === 'device' && before.get(d.id) !== 'device');
-  const viewingNothing = S.loc.type === 'welcome' || ((S.loc.kind === 'device' || S.loc.type === 'device-root') && !list.some((d) => d.id === S.loc.id));
-  if (ready && (viewingNothing || (S.loc.id === ready.id && before.get(ready.id) !== 'device'))) {
-    if (S.loc.id === ready.id && S.loc.type === 'dir') {
+  const loc = phonePane.loc;
+  const viewingNothing = loc.type === 'welcome' || (isDeviceLoc(loc) && !list.some((d) => d.id === loc.id));
+  if (ready && (viewingNothing || loc.id === ready.id)) {
+    if (loc.id === ready.id && loc.type === 'dir') {
       // Same phone reconnected while we were in one of its folders: just reload.
       renderAll();
-      load();
-    } else navigate({ type: 'device-root', id: ready.id });
+      load(phonePane);
+    } else navigate(phonePane, { type: 'device-root', id: ready.id });
     return;
   }
-  if (!list.length && S.loc.type === 'device-root') {
-    navigate({ type: 'welcome' });
-    return;
-  }
+  if (!list.length && loc.type === 'device-root') return navigate(phonePane, { type: 'welcome' });
   // Waiting for authorization etc.: show the right screen.
-  if (S.loc.type === 'welcome' && list.length) {
-    navigate({ type: 'device-root', id: list[0].id });
-    return;
-  }
+  if (loc.type === 'welcome' && list.length) return navigate(phonePane, { type: 'device-root', id: list[0].id });
   renderAll();
 }
 
@@ -1605,17 +1643,11 @@ async function main() {
   });
   api.onTransfer(onTransferUpdate);
   api.onConflict(onConflict);
-  try {
-    S.finder = await api.finderStatus();
-  } catch {}
-  api.onFinder((mounts) => {
-    S.finder.mounts = mounts;
-    refreshFinderCard();
-  });
-  api.onFinderError(({ message }) => toast(`לא ניתן לחבר ל-Finder: ${message}`, true));
-  navigate({ type: 'welcome' });
+  navigate(panes[0], { type: 'welcome' });
+  if (S.split) navigate(panes[1], defaultMacLoc());
+  renderAll();
   if (info.devices && info.devices.length) onDevices(info.devices);
-  contentEl.focus();
+  panes[0].content.focus();
 }
 
 main();

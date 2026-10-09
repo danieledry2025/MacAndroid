@@ -20,31 +20,57 @@
 
       <main>
         <header class="toolbar drag">
-          <div class="nav-buttons no-drag">
-            <button id="btn-back" class="icon-btn" title="אחורה (⌘[)"></button>
-            <button id="btn-forward" class="icon-btn" title="קדימה (⌘])"></button>
-            <button id="btn-up" class="icon-btn" title="תיקייה למעלה (⌘↑)"></button>
-          </div>
-          <div id="breadcrumbs" class="breadcrumbs no-drag"></div>
-          <div class="toolbar-end no-drag">
-            <div class="search">
-              <input id="search" type="search" placeholder="חיפוש בתיקייה" />
-            </div>
+          <button id="btn-split" class="btn toggle" title="הצג טלפון ומחשב זה לצד זה"></button>
+          <span class="spacer"></span>
+          <div class="toolbar-end">
+            <label class="sort">
+              <span>מיון:</span>
+              <select id="sort-key">
+                <option value="mtime">תאריך</option>
+                <option value="name">שם</option>
+                <option value="size">גודל</option>
+                <option value="kind">סוג</option>
+              </select>
+              <button id="sort-dir" class="icon-btn" title="הפוך סדר"></button>
+            </label>
             <div class="segmented" role="group" aria-label="תצוגה">
               <button id="view-grid" class="icon-btn" title="סמלים גדולים"></button>
               <button id="view-list" class="icon-btn" title="פרטים"></button>
+            </div>
+            <div class="search">
+              <input id="search" type="search" placeholder="חיפוש בתיקייה" />
             </div>
           </div>
         </header>
 
         <div id="actionbar" class="actionbar"></div>
 
-        <section id="content" class="content" tabindex="0"></section>
-
-        <footer class="statusbar">
-          <span id="status-left"></span>
-          <span id="status-right"></span>
-        </footer>
+        <div id="panes" class="panes">
+          <section class="pane" data-pane="0">
+            <div class="pane-head">
+              <div class="nav-buttons">
+                <button class="icon-btn" data-pnav="back" title="אחורה (⌘[)"></button>
+                <button class="icon-btn" data-pnav="forward" title="קדימה (⌘])"></button>
+                <button class="icon-btn" data-pnav="up" title="תיקייה למעלה (⌘↑)"></button>
+              </div>
+              <div class="breadcrumbs"></div>
+            </div>
+            <div class="content" tabindex="0"></div>
+            <footer class="statusbar"><span class="status-left"></span><span class="status-right"></span></footer>
+          </section>
+          <section class="pane" data-pane="1">
+            <div class="pane-head">
+              <div class="nav-buttons">
+                <button class="icon-btn" data-pnav="back" title="אחורה (⌘[)"></button>
+                <button class="icon-btn" data-pnav="forward" title="קדימה (⌘])"></button>
+                <button class="icon-btn" data-pnav="up" title="תיקייה למעלה (⌘↑)"></button>
+              </div>
+              <div class="breadcrumbs"></div>
+            </div>
+            <div class="content" tabindex="0"></div>
+            <footer class="statusbar"><span class="status-left"></span><span class="status-right"></span></footer>
+          </section>
+        </div>
       </main>
     </div>
 

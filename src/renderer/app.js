@@ -38,6 +38,8 @@ const S = {
   transfers: new Map(),
   thumbCache: new Map(),
   renaming: null,
+  finder: { supported: false, mounts: {}, settings: {} },
+  preparedDrag: new Set(), // phone files already copied to temp, so dragging them out is instant
   viewer: null,
   autoOpened: new Set(),
 };
@@ -425,6 +427,7 @@ function renderActionbar() {
       <button class="btn" data-act="paste" ${canPaste ? '' : 'disabled'} title="⌘V">${ICONS.paste}הדבק</button>
       <button class="btn danger" data-act="delete" ${n ? '' : 'disabled'}>${ICONS.trash}מחק</button>
       <span class="spacer"></span>
+      ${S.finder.supported ? `<button class="btn" data-act="finder-open" title="פתח את התיקייה הזו ב-Finder">${ICONS.finder}פתח ב-Finder</button>` : ''}
       <button class="icon-btn" data-act="refresh" title="רענן (⌘R)">${ICONS.refresh}</button>`;
   } else if (isLocalDir()) {
     const d = readyDevices()[0];
@@ -571,6 +574,7 @@ async function renderDrives(d) {
     })
     .join('');
   contentEl.innerHTML = `<div class="drives"><h2>${esc(d.name)}</h2>${drives}
+    ${finderCardHtml(d)}
     <div class="shortcuts" id="shortcuts"></div></div>`;
   contentEl.querySelectorAll('.drive').forEach((el) => (el._loc = { type: 'dir', kind: 'device', id: d.id, path: sts[Number(el.dataset.drive)].path }));
 
@@ -603,6 +607,56 @@ async function renderDrives(d) {
     .map((c, i) => `<div class="tile" data-shortcut="${i}" data-drop="shortcut"><div class="thumb">${FOLDER_SVG}</div><div class="name">${esc(c.label)}</div></div>`)
     .join('')}</div>`;
   box.querySelectorAll('[data-shortcut]').forEach((el) => (el._loc = { type: 'dir', kind: 'device', id: d.id, path: found[Number(el.dataset.shortcut)].path }));
+}
+
+function finderCardHtml(d) {
+  if (!S.finder.supported) return '';
+  const st = S.finder.mounts[d.id] || {};
+  let status;
+  let buttons;
+  if (st.busy) {
+    status = 'מחבר ל-Finder…';
+    buttons = '<div class="spinner small"></div>';
+  } else if (st.mounted) {
+    status = `מופיע ב-Finder תחת "מיקומים" בשם "${esc(d.name)}"`;
+    buttons = `<button class="btn primary" data-act="finder-open">${ICONS.finder}פתח ב-Finder</button>
+      <button class="btn" data-act="finder-unmount">נתק מ-Finder</button>`;
+  } else {
+    status = 'הצג את הטלפון ככונן רגיל בתוך Finder';
+    buttons = `<button class="btn primary" data-act="finder-mount">${ICONS.finder}הצג ב-Finder</button>`;
+  }
+  return `<div class="finder-card" id="finder-card">
+    <div class="finder-main">
+      <div class="finder-icon">${ICONS.finder}</div>
+      <div class="info"><div class="title">הטלפון ב-Finder</div><div class="muted">${status}</div></div>
+      <div class="finder-buttons">${buttons}</div>
+    </div>
+    <label class="check"><input type="checkbox" data-setting="autoMountFinder" ${S.finder.settings.autoMountFinder ? 'checked' : ''}>
+      חבר ל-Finder אוטומטית בכל פעם שמחברים טלפון</label>
+  </div>`;
+}
+
+function refreshFinderCard() {
+  const card = $('#finder-card');
+  const d = S.loc.type === 'device-root' ? device(S.loc.id) : null;
+  if (card && d) card.outerHTML = finderCardHtml(d);
+}
+
+async function finderAction(act) {
+  const id = S.loc.id;
+  try {
+    if (act === 'finder-mount') {
+      await api.finderMount(id);
+      await api.finderReveal(id, null);
+    } else if (act === 'finder-unmount') {
+      await api.finderUnmount(id);
+    } else {
+      toast('פותח ב-Finder…');
+      await api.finderReveal(id, isDeviceDir() ? S.loc.path : null);
+    }
+  } catch (err) {
+    toast(`Finder: ${errMsg(err)}`, true);
+  }
 }
 
 function renderWelcome() {
@@ -902,6 +956,10 @@ function runAction(act) {
       return deleteSelection();
     case 'refresh':
       return reload();
+    case 'finder-open':
+    case 'finder-mount':
+    case 'finder-unmount':
+      return finderAction(act);
   }
 }
 
@@ -1128,6 +1186,47 @@ function dropTargetFor(el) {
 
 let dragSource = null;
 let dropHighlight = null;
+let nativeDrag = null; // { from, paths, files }: items dragged with a real OS file drag
+let dragToken = 0;
+let mouseIsDown = false;
+// Bigger than this and not already prepared: drag stays inside the app, the copy button handles Finder.
+const NATIVE_DRAG_LIMIT = 500 * 1024 * 1024;
+
+const sameSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
+
+/** Copy phone items to temp files (with a progress toast), then start a real file drag. */
+async function prepareAndDrag(entries, src) {
+  const token = ++dragToken;
+  let toastShown = false;
+  const showTimer = setTimeout(() => {
+    toastShown = true;
+    toast('מכין את הקבצים לגרירה…');
+  }, 250);
+  const off = api.onDragProgress(({ done, total }) => {
+    if (toastShown && token === dragToken && total) toast(`מכין את הקבצים לגרירה… ${Math.floor((done / total) * 100)}%`);
+  });
+  let files;
+  try {
+    files = await api.prepareDrag(fsLoc(), entries);
+  } catch (err) {
+    toast(errMsg(err), true);
+    return;
+  } finally {
+    clearTimeout(showTimer);
+    off();
+  }
+  for (const e of entries) if (!e.isDir) S.preparedDrag.add(thumbKey(e));
+  if (token !== dragToken) return;
+  if (!mouseIsDown) {
+    // The mouse was released while we were copying; the files are cached now, so the next drag is instant.
+    dragSource = null;
+    toast('הקבצים מוכנים. גרור שוב כדי להעביר אותם ל-Finder');
+    return;
+  }
+  if (toastShown) $('#toast').classList.add('hidden');
+  nativeDrag = { ...src, files };
+  api.startDrag(files, S.thumbCache.get(thumbKey(entries[0])) || null);
+}
 
 function clearDropHighlight() {
   if (dropHighlight) dropHighlight.classList.remove('drop-target', 'drop-active');
@@ -1135,12 +1234,39 @@ function clearDropHighlight() {
 }
 
 function setupDnD() {
+  document.addEventListener('mousedown', () => {
+    mouseIsDown = true;
+    nativeDrag = null;
+    dragToken++;
+  }, true);
+  document.addEventListener('mouseup', () => {
+    mouseIsDown = false;
+  }, true);
+
   document.addEventListener('dragstart', (ev) => {
     const row = ev.target.closest && ev.target.closest('[data-i]');
     if (!row || !isDir()) return;
     const i = Number(row.dataset.i);
     if (!S.selection.has(S.shown[i].path)) selectIndex(i);
-    dragSource = { from: { kind: S.loc.kind, id: S.loc.id }, paths: selectedEntries().map((e) => e.path) };
+    const entries = selectedEntries();
+    dragSource = { from: { kind: S.loc.kind, id: S.loc.id }, paths: entries.map((e) => e.path) };
+
+    // Real OS file drag, so items can be dropped into Finder (or any app) as well as inside this window.
+    if (S.loc.kind === 'local') {
+      ev.preventDefault();
+      nativeDrag = { ...dragSource, files: dragSource.paths };
+      api.startDrag(dragSource.paths, S.thumbCache.get(thumbKey(entries[0])) || null);
+      return;
+    }
+    const unprepared = entries.filter((e) => e.isDir || !S.preparedDrag.has(thumbKey(e)));
+    const bytes = unprepared.reduce((a, e) => a + (e.isDir ? 0 : e.size || 0), 0);
+    if (bytes <= NATIVE_DRAG_LIMIT) {
+      ev.preventDefault();
+      prepareAndDrag(entries, dragSource);
+      return;
+    }
+    // Very large files: drag within the app only (to a Mac folder in the sidebar).
+    toast('קבצים גדולים: גרור לתיקייה בסרגל הצד, או השתמש ב"העתק למחשב"');
     ev.dataTransfer.setData(DRAG_MIME, JSON.stringify(dragSource));
     ev.dataTransfer.effectAllowed = 'copy';
   });
@@ -1194,7 +1320,16 @@ function setupDnD() {
       return;
     }
     const files = [...ev.dataTransfer.files].map((f) => api.pathForFile(f)).filter(Boolean);
-    if (files.length) startTransfer({ kind: 'local' }, files, target.loc);
+    if (!files.length) return;
+    if (nativeDrag && sameSet(files, nativeDrag.files)) {
+      // Our own drag landed back in the window: copy from the original place, not the temp copies.
+      const src = nativeDrag;
+      nativeDrag = null;
+      dragSource = null;
+      startTransfer(src.from, src.paths, target.loc);
+      return;
+    }
+    startTransfer({ kind: 'local' }, files, target.loc);
   });
 }
 
@@ -1300,6 +1435,10 @@ function setupEvents() {
       contentEl.querySelectorAll('.drive.selected').forEach((d) => d.classList.remove('selected'));
       drive.classList.add('selected');
     }
+  });
+  contentEl.addEventListener('change', async (ev) => {
+    const key = ev.target.dataset && ev.target.dataset.setting;
+    if (key) S.finder.settings = await api.setSettings({ [key]: ev.target.checked });
   });
   contentEl.addEventListener('dblclick', (ev) => {
     const row = ev.target.closest('[data-i]');
@@ -1466,6 +1605,14 @@ async function main() {
   });
   api.onTransfer(onTransferUpdate);
   api.onConflict(onConflict);
+  try {
+    S.finder = await api.finderStatus();
+  } catch {}
+  api.onFinder((mounts) => {
+    S.finder.mounts = mounts;
+    refreshFinderCard();
+  });
+  api.onFinderError(({ message }) => toast(`לא ניתן לחבר ל-Finder: ${message}`, true));
   navigate({ type: 'welcome' });
   if (info.devices && info.devices.length) onDevices(info.devices);
   contentEl.focus();

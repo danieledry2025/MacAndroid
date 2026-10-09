@@ -29,6 +29,7 @@ const ICONS = {
   video: ui('<rect x="3" y="5" width="13" height="14" rx="2"/><path d="M16 10l5-3v10l-5-3"/>'),
   home: ui('<path d="M4 11l8-7 8 7v9a1 1 0 01-1 1h-4v-6H9v6H5a1 1 0 01-1-1z"/>'),
   usb: ui('<path d="M12 3v14M9 6l3-3 3 3M8 11v2l4 3M16 9v3l-4 3"/><circle cx="12" cy="19" r="2"/>'),
+  finder: ui('<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M12 3c-1.5 3-2 6-1.5 10H13M8 9v1.5M16 9v1.5M7.5 15.5c2.6 2 6.4 2 9 0"/>'),
   folderSmall: ui('<path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/>'),
 };
 

@@ -76,6 +76,10 @@ class LocalFs {
     return fs.createReadStream(this.real(p), { highWaterMark: 1024 * 1024 });
   }
 
+  async openReadRange(p, start, end) {
+    return fs.createReadStream(this.real(p), { start, end });
+  }
+
   async writeFrom(readable, p) {
     await pipeline(readable, fs.createWriteStream(this.real(p)));
   }

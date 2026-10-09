@@ -853,3 +853,50 @@ body.mac .toolbar {
 .toast.error {
   background: var(--danger);
 }
+
+/* Finder card on the phone's main screen */
+.finder-card {
+  width: 100%;
+  max-width: 614px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--card);
+  padding: 14px;
+}
+.finder-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.finder-icon svg {
+  width: 40px;
+  height: 40px;
+  color: var(--accent);
+  stroke-width: 1.4;
+}
+.finder-card .info {
+  flex: 1;
+  min-width: 0;
+}
+.finder-card .title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.finder-buttons {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.spinner.small {
+  width: 18px;
+  height: 18px;
+  border-width: 2px;
+}

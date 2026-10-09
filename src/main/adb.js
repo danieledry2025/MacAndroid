@@ -6,6 +6,8 @@ const path = require('path');
 const { EventEmitter } = require('events');
 const { execFileSync } = require('child_process');
 const { Adb } = require('@devicefarmer/adbkit');
+const AdbCommand = require('@devicefarmer/adbkit/dist/src/adb/command').default;
+const Protocol = require('@devicefarmer/adbkit/dist/src/adb/protocol').default;
 const { shq, rjoin, sortEntries, parseDf, externalVolumes } = require('./util');
 
 const S_IFMT = 0o170000;
@@ -37,6 +39,18 @@ function findAdb() {
     if (found) return found;
   } catch {}
   return null;
+}
+
+/** Runs a command through adbd's `exec:` service: raw binary output, no pty newline mangling. */
+class ExecCommand extends AdbCommand {
+  execute(cmd) {
+    this._send(`exec:${cmd}`);
+    return this.parser.readAscii(4).then((reply) => {
+      if (reply === Protocol.OKAY) return this.parser.raw();
+      if (reply === Protocol.FAIL) return this.parser.readError();
+      return this.parser.unexpected(reply, 'OKAY or FAIL');
+    });
+  }
 }
 
 /** File system operations on one connected Android device. */
@@ -122,6 +136,13 @@ class DeviceFs {
   /** Readable stream of a device file. */
   async openRead(p) {
     return this.dev.pull(p);
+  }
+
+  /** Readable stream of bytes `start`..`end` (inclusive) of a device file. */
+  async openReadRange(p, start, end) {
+    const transport = await this.dev.transport();
+    // toybox tail/head do the seeking on the phone, so only the requested bytes cross the cable.
+    return new ExecCommand(transport).execute(`tail -c +${start + 1} ${shq(p)} | head -c ${end - start + 1}`);
   }
 
   /** Write a readable stream to the device. Resolves when the file is fully written. */

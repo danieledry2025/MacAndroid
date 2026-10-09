@@ -5,12 +5,13 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { pipeline } = require('stream/promises');
-const { app, BrowserWindow, ipcMain, shell, dialog, Menu, clipboard, nativeTheme } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, Menu, clipboard, nativeTheme, nativeImage } = require('electron');
 const { AdbManager } = require('./adb');
 const { MockManager } = require('./mock');
 const { LocalFs } = require('./local');
 const { TransferQueue } = require('./transfers');
 const { Thumbnailer } = require('./thumbs');
+const { FinderMounts } = require('./finder');
 const { uniqueName } = require('./util');
 
 const mockEnv = process.env.MACANDROID_MOCK || (process.argv.includes('--mock') ? '1' : '');
@@ -24,6 +25,21 @@ let thumbs = null;
 let lastAdbError = null;
 let lastMacFolder = null;
 const conflictWaiters = new Map();
+const finder = new FinderMounts();
+let settings = { autoMountFinder: true };
+const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
+
+function loadSettings() {
+  try {
+    settings = { ...settings, ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) };
+  } catch {}
+}
+
+function saveSettings() {
+  try {
+    fs.writeFileSync(settingsFile(), JSON.stringify(settings, null, 2));
+  } catch {}
+}
 let conflictSeq = 0;
 
 function send(channel, payload) {
@@ -66,7 +82,7 @@ function places() {
 }
 
 /** Copy a device file to a temp folder so macOS apps (Preview, QuickTime...) can open it. */
-async function materialize(loc, entry) {
+async function materialize(loc, entry, onBytes) {
   const fsys = fsFor(loc);
   const direct = fsys.localPath ? fsys.localPath(entry.path) : null;
   if (direct) return direct;
@@ -75,8 +91,63 @@ async function materialize(loc, entry) {
   const out = path.join(dir, entry.name);
   if (fs.existsSync(out) && fs.statSync(out).size === entry.size) return out;
   fs.mkdirSync(dir, { recursive: true });
-  await pipeline(await fsys.openRead(entry.path), fs.createWriteStream(out));
+  const src = await fsys.openRead(entry.path);
+  if (onBytes) src.on('data', (c) => onBytes(c.length));
+  await pipeline(src, fs.createWriteStream(out + '.part'));
+  fs.renameSync(out + '.part', out);
   return out;
+}
+
+/** Copy a phone folder into a fresh temp folder (for dragging it out to Finder). */
+async function materializeDir(loc, entry, onBytes) {
+  const fsys = fsFor(loc);
+  const root = path.join(app.getPath('temp'), 'MacAndroid', 'drag', crypto.randomBytes(6).toString('hex'), entry.name);
+  const walk = async (remote, local) => {
+    fs.mkdirSync(local, { recursive: true });
+    for (const e of await fsys.readdir(remote)) {
+      if (e.isDir) await walk(e.path, path.join(local, e.name));
+      else {
+        const src = await fsys.openRead(e.path);
+        if (onBytes) src.on('data', (c) => onBytes(c.length));
+        await pipeline(src, fs.createWriteStream(path.join(local, e.name)));
+      }
+    }
+  };
+  await walk(entry.path, root);
+  return root;
+}
+
+async function treeSize(fsys, p) {
+  let total = 0;
+  for (const e of await fsys.readdir(p)) total += e.isDir ? await treeSize(fsys, e.path) : e.size;
+  return total;
+}
+
+function deviceInfo(id) {
+  return (devices.list ? devices.list() : []).find((d) => d.id === id);
+}
+
+function mountDevice(id) {
+  const d = deviceInfo(id);
+  if (!d || d.state !== 'device') return Promise.reject(new Error('המכשיר לא מחובר'));
+  const fsys = devices.fs(id);
+  return finder.mount(id, { fsys, name: d.name, storages: () => fsys.storages() });
+}
+
+/** Keep Finder in sync with what is plugged in. */
+function syncMounts(list) {
+  const ready = new Set(list.filter((d) => d.state === 'device').map((d) => d.id));
+  for (const id of Object.keys(finder.all())) if (!ready.has(id)) finder.unmount(id).catch(() => {});
+  if (!settings.autoMountFinder || !finder.supported) return;
+  for (const id of ready) {
+    if (!finder.status(id).mounted && !finder.status(id).busy && !finder.autoTried?.has(id)) {
+      finder.autoTried = finder.autoTried || new Set();
+      finder.autoTried.add(id);
+      mountDevice(id).catch((err) => send('finder:error', { id, message: err.message }));
+    }
+  }
+  // Forget devices that left, so plugging them in again mounts again.
+  if (finder.autoTried) for (const id of finder.autoTried) if (!ready.has(id)) finder.autoTried.delete(id);
 }
 
 function registerIpc() {
@@ -125,6 +196,48 @@ function registerIpc() {
   });
 
   ipcMain.handle('fs:preview', (_e, loc, entry) => materialize(loc, entry));
+
+  ipcMain.handle('finder:status', () => ({ supported: finder.supported, mounts: finder.all(), settings }));
+  ipcMain.handle('finder:mount', (_e, id) => mountDevice(id));
+  ipcMain.handle('finder:unmount', (_e, id) => finder.unmount(id));
+  ipcMain.handle('finder:reveal', async (_e, id, devicePath) => {
+    if (!finder.status(id).mounted) await mountDevice(id);
+    await finder.reveal(id, devicePath, await devices.fs(id).storages());
+  });
+  ipcMain.handle('settings:set', (_e, patch) => {
+    settings = { ...settings, ...patch };
+    saveSettings();
+    if (patch.autoMountFinder) syncMounts(devices.list ? devices.list() : []);
+    return settings;
+  });
+
+  /** Copy phone items to temp files so they can be dragged out to Finder. */
+  ipcMain.handle('drag:prepare', async (e, loc, entries) => {
+    const fsys = fsFor(loc);
+    let total = 0;
+    for (const en of entries) total += en.isDir ? await treeSize(fsys, en.path) : en.size;
+    let done = 0;
+    let last = 0;
+    const onBytes = (n) => {
+      done += n;
+      if (Date.now() - last > 150) {
+        last = Date.now();
+        e.sender.send('drag:progress', { done, total });
+      }
+    };
+    const files = [];
+    for (const en of entries) files.push(en.isDir ? await materializeDir(loc, en, onBytes) : await materialize(loc, en, onBytes));
+    return files;
+  });
+
+  ipcMain.on('drag:start', (e, files, iconPath) => {
+    let icon = iconPath ? nativeImage.createFromPath(iconPath) : null;
+    if (!icon || icon.isEmpty()) icon = nativeImage.createFromPath(path.join(__dirname, '..', 'assets', 'icon.png'));
+    icon = icon.resize({ width: 64 });
+    try {
+      e.sender.startDrag(files.length === 1 ? { file: files[0], icon } : { file: files[0], files, icon });
+    } catch {}
+  });
   ipcMain.handle('fs:reveal', (_e, p) => shell.showItemInFolder(p));
 
   ipcMain.handle('thumb:get', async (_e, loc, entry, gen) => {
@@ -261,12 +374,17 @@ function appMenu() {
 }
 
 app.whenReady().then(async () => {
+  loadSettings();
   thumbs = new Thumbnailer(path.join(app.getPath('userData'), 'thumbs'), path.join(app.getPath('temp'), 'MacAndroid', 'thumb-src'));
   registerIpc();
   appMenu();
   createWindow();
 
-  devices.on('devices', (list) => send('devices', list));
+  devices.on('devices', (list) => {
+    send('devices', list);
+    syncMounts(list);
+  });
+  finder.on('change', () => send('finder', finder.all()));
   devices.on('error-state', (err) => {
     lastAdbError = err;
     send('adb-error', err);
@@ -281,4 +399,14 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', () => {
   devices.stop();
   app.quit();
+});
+
+// Take the phone out of Finder before quitting, so no dead drive is left behind.
+let quitting = false;
+app.on('before-quit', (e) => {
+  if (quitting || !Object.keys(finder.all()).length) return;
+  e.preventDefault();
+  quitting = true;
+  const timeout = new Promise((r) => setTimeout(r, 5000));
+  Promise.race([finder.unmountAll(), timeout]).finally(() => app.quit());
 });

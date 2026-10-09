@@ -11,9 +11,9 @@
     "demo": "electron . --mock",
     "test": "node --test test/*.test.js",
     "fetch-adb": "node scripts/fetch-adb.js",
-    "dist": "node scripts/fetch-adb.js && electron-builder --mac",
-    "dist:arm64": "node scripts/fetch-adb.js && electron-builder --mac --arm64",
-    "dist:x64": "node scripts/fetch-adb.js && electron-builder --mac --x64"
+    "dist": "node scripts/fetch-adb.js && electron-builder --mac --publish never",
+    "dist:arm64": "node scripts/fetch-adb.js && electron-builder --mac --arm64 --publish never",
+    "dist:x64": "node scripts/fetch-adb.js && electron-builder --mac --x64 --publish never"
   },
   "dependencies": {
     "@devicefarmer/adbkit": "^3.3.9"
